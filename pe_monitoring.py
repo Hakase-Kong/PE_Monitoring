@@ -304,7 +304,6 @@ with st.sidebar:
     st.divider()
     st.subheader("config.json")
     if st.button("구성 리로드"):
-        global CONFIG
         CONFIG = load_config()
         st.success("config.json을 다시 불러왔습니다.")
 
