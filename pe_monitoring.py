@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 # =========================
 RUN_SEEN_URLS = set()
 RUN_SEEN_TITLES = set()
-last_run_info = {"ts": None, "sent": 0, "picked": 0}
+last_run_info = {"ts": None, "sent": 0, "picked": 0, "note": ""}
 
 # =========================
 # 유틸
@@ -204,18 +204,19 @@ def filter_and_rank(items, cfg):
     if inc_words:
         kept = []
         for x in items:
-            if title_has_any(x["title"], inc_words):
-                kept.append(x)
-            else:
-                # 포함어가 없더라도 워치리스트/도메인 점수로 올라올 수 있게 low priority로 남김
-                kept.append(x)
+            # 포함 단어가 있으면 약간 우선시(뒤 스코어링에서 반영), 여기서는 걸러내지 않음
+            kept.append(x)
         items = kept
 
     # 3) 도메인 허용/차단
     allow = set([d.lower() for d in cfg.get("ALLOW_DOMAINS", [])])
     block = set([d.lower() for d in cfg.get("BLOCK_DOMAINS", [])])
-    if allow:
-        items = [x for x in items if get_domain(x["link"]) in allow or "naver.com" in get_domain(x["link"])]
+    strict = to_bool(cfg.get("ALLOWLIST_STRICT", False), False)
+
+    # 기본: 차단 도메인만 제외, ALLOW는 가중치/선호 역할 (해외 소스 포함)
+    if strict and allow:
+        items = [x for x in items if get_domain(x["link"]) in allow]
+    # 항상 차단 목록은 제거
     items = [x for x in items if get_domain(x["link"]) not in block]
 
     # 4) 최신성
@@ -328,12 +329,13 @@ def format_bucket_message(bucket, items):
         lines.append(f"• {it['title']} ({it['link']}) — {src} ({ts})")
     return "\n".join(lines)
 
-def transmit_once(cfg, preview=False):
+def transmit_once(cfg, preview=False, ignore_hours=False):
     global RUN_SEEN_URLS, RUN_SEEN_TITLES, last_run_info
+
     # 근무시간 제한
-    if to_bool(cfg.get("ONLY_WORKING_HOURS", False), False):
-        if not within_working_hours():
-            return {"picked": 0, "sent": 0, "skipped": "off_hours"}
+    if to_bool(cfg.get("ONLY_WORKING_HOURS", False), False) and not ignore_hours:
+        last_run_info = {"ts": now_kst(), "sent": 0, "picked": 0, "note": "off_hours"}
+        return {"picked": 0, "sent": 0, "skipped": "off_hours"}
 
     batches = make_batches(cfg)
     disable_preview = to_bool(cfg.get("TELEGRAM_DISABLE_PREVIEW", True), True)
@@ -353,11 +355,14 @@ def transmit_once(cfg, preview=False):
             msg = format_bucket_message(bucket, arr)
             if not msg:
                 continue
-            ok, _ = send_telegram_message(msg, disable_preview=disable_preview)
+            ok, err = send_telegram_message(msg, disable_preview=disable_preview)
             if ok:
                 total_sent += len(arr)
+            else:
+                # 전송 실패 시에도 에러 내용을 상태에 남김
+                last_run_info = {"ts": now_kst(), "sent": total_sent, "picked": total_picked, "note": f"TG_FAIL:{err}"}
 
-    last_run_info = {"ts": now_kst(), "sent": total_sent, "picked": total_picked}
+    last_run_info = {"ts": now_kst(), "sent": total_sent, "picked": total_picked, "note": ""}
     return {"picked": total_picked, "sent": total_sent, "skipped": None}
 
 # =========================
@@ -372,7 +377,7 @@ def start_schedule(cfg):
         if SCHED.get_job(JOB_ID):
             return
         interval = int(cfg.get("TRANSMIT_INTERVAL_MIN", 60))
-        SCHED.add_job(lambda: transmit_once(cfg, preview=False),
+        SCHED.add_job(lambda: transmit_once(cfg, preview=False, ignore_hours=False),
                       "interval", minutes=interval, id=JOB_ID, max_instances=1)
         if not SCHED.running:
             SCHED.start()
@@ -419,36 +424,47 @@ with st.sidebar:
                         value=int(cfg.get("RECENCY_HOURS", 48)), key="rc", disabled=True)
         st.checkbox("업무시간(08~20 KST) 내 전송", value=to_bool(cfg.get("ONLY_WORKING_HOURS", True)), disabled=True)
         st.checkbox("링크 프리뷰 비활성화", value=to_bool(cfg.get("TELEGRAM_DISABLE_PREVIEW", True)), disabled=True)
+        st.checkbox("ALLOWLIST_STRICT (허용 도메인만 통과)", value=to_bool(cfg.get("ALLOWLIST_STRICT", False)), disabled=True)
     else:
         st.error("config.json을 읽을 수 없습니다. 경로/JSON 문법을 확인하세요.")
 
 st.title("📬 PE 동향 뉴스 → Telegram 자동 전송")
 st.caption("Streamlit + NewsAPI/Naver + Telegram + APScheduler")
 
-col1, col2, col3 = st.columns([1,1,1])
+col1, col2, col3, col4 = st.columns([1,1,1,1])
 with col1:
     if st.button("지금 한 번 실행", use_container_width=True):
         if not cfg:
             st.error("config.json을 불러오지 못했습니다.")
         else:
-            res = transmit_once(cfg, preview=True)
-            st.success(f"완료: {res['picked']}건 미리보기, {0}건 전송(미리보기 모드)")
+            res = transmit_once(cfg, preview=True, ignore_hours=True)
+            st.success(f"완료: {res['picked']}건 미리보기, {0}건 전송(미리보기)")
 with col2:
+    if st.button("지금 한 번 전송", use_container_width=True):
+        if not cfg:
+            st.error("config.json을 불러오지 못했습니다.")
+        else:
+            res = transmit_once(cfg, preview=False, ignore_hours=True)
+            st.success(f"전송 완료: {res['sent']}건 전송 / 선별 {res['picked']}건")
+with col3:
     if st.button("스케줄 시작", use_container_width=True):
         if not cfg:
             st.error("config.json을 불러오지 못했습니다.")
         else:
             start_schedule(cfg)
-with col3:
+            st.info("스케줄 시작됨.")
+with col4:
     if st.button("스케줄 중지", use_container_width=True):
         stop_schedule()
+        st.info("스케줄 중지됨.")
 
 st.divider()
 st.subheader("상태")
 
 st.write(f"Scheduler 실행 중: **{scheduler_running()}**")
 if last_run_info["ts"]:
-    st.write(f"마지막 수행 시각: **{last_run_info['ts'].strftime('%Y-%m-%d %H:%M:%S')}**")
+    msg_note = f" (note: {last_run_info['note']})" if last_run_info.get("note") else ""
+    st.write(f"마지막 수행 시각: **{last_run_info['ts'].strftime('%Y-%m-%d %H:%M:%S')}** / 선별: {last_run_info['picked']} / 전송: {last_run_info['sent']}{msg_note}")
 st.info("config.json의 KEYWORDS가 비어 있습니다." if (cfg and not cfg.get("KEYWORDS")) else "")
 
 # 미리보기 블록
@@ -458,9 +474,13 @@ if cfg:
     # 키워드 섹션별로 상위 10개만 표시
     for bucket in cfg.get("KEYWORDS", []):
         items = preview.get(bucket, [])[:10]
-        if not items:
-            continue
         with st.expander(f"{bucket} — {len(items)}건", expanded=False):
+            if not items:
+                st.caption("결과 없음")
             for it in items:
                 ts = it["pub_dt"].strftime("%Y-%m-%d %H:%M") if it.get("pub_dt") else ""
-                st.markdown(f"- [{it['title']}]({it['link']})  \n  <span style='font-size:12px;color:#888'>{it.get('source','')} — {ts}</span>", unsafe_allow_html=True)
+                st.markdown(
+                    f"- [{it['title']}]({it['link']})  \n"
+                    f"  <span style='font-size:12px;color:#888'>{it.get('source','')} — {ts}</span>",
+                    unsafe_allow_html=True
+                )
