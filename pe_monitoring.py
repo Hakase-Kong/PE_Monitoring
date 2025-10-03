@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import requests
 import streamlit as st
 from apscheduler.schedulers.background import BackgroundScheduler
+from zoneinfo import ZoneInfo
 
 # =========================
 # 전역 상태 (런타임 교차 중복 제거)
@@ -23,7 +24,7 @@ last_run_info = {"ts": None, "sent": 0, "picked": 0}
 # =========================
 # 유틸
 # =========================
-KST = timezone(timedelta(hours=9))
+KST = ZoneInfo("Asia/Seoul")
 
 def now_kst():
     return datetime.now(tz=KST)
@@ -362,7 +363,7 @@ def transmit_once(cfg, preview=False):
 # =========================
 # 스케줄러
 # =========================
-SCHED = BackgroundScheduler(timezone=str(KST))
+SCHED = BackgroundScheduler(timezone="Asia/Seoul")
 JOB_ID = "pe_monitoring_job"
 JOB_LOCK = threading.Lock()
 
