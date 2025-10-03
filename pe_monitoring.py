@@ -250,9 +250,9 @@ with st.sidebar:
     st.subheader("config.json")
     st.caption(f"로드 경로: {CONFIG_PATH}")
     if st.button("구성 리로드"):
-        global CONFIG
         CONFIG = load_config()
         st.success("config.json을 다시 불러왔습니다.")
+
 
     st.text("KEYWORDS (읽기전용)")
     st.code("\n".join(CONFIG.get("KEYWORDS", [])), language="text")
