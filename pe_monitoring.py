@@ -30,7 +30,7 @@ STORAGE_DIR = os.environ.get("STORAGE_DIR", os.path.join(BASE_DIR, ".pe_news_sta
 os.makedirs(STORAGE_DIR, exist_ok=True)
 SENT_DB_PATH = os.path.join(STORAGE_DIR, "sent_urls.json")
 
-CONFIG_PATH = os.environ.get("CONFIG_PATH", os.path.join(BASE_DIR, "config.json"))
+CONFIG_PATH = "/opt/render/project/src/config.json"
 
 DEFAULT_CONFIG = {
     "KEYWORDS": [],
