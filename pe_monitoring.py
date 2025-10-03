@@ -1,8 +1,3 @@
-# pe_monitoring.py
-# Streamlit + Naver/NewsAPI → Telegram 자동 전송
-# - 키워드는 전부 config.json에서 관리
-# - 동의어 확장, 유사 기사 제거, 워치리스트 가산점 포함
-
 import os
 import re
 import json
@@ -20,7 +15,7 @@ from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 
 # =========================
-# 기본 로깅
+# 로깅
 # =========================
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -30,11 +25,12 @@ logging.basicConfig(
 # =========================
 # 경로/상수
 # =========================
-STORAGE_DIR = os.environ.get("STORAGE_DIR", ".pe_news_state")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STORAGE_DIR = os.environ.get("STORAGE_DIR", os.path.join(BASE_DIR, ".pe_news_state"))
 os.makedirs(STORAGE_DIR, exist_ok=True)
 SENT_DB_PATH = os.path.join(STORAGE_DIR, "sent_urls.json")
 
-CONFIG_PATH = os.environ.get("CONFIG_PATH", "config.json")
+CONFIG_PATH = os.environ.get("CONFIG_PATH", os.path.join(BASE_DIR, "config.json"))
 
 DEFAULT_CONFIG = {
     "KEYWORDS": [],
@@ -57,6 +53,7 @@ DEFAULT_CONFIG = {
     "TELEGRAM_DISABLE_PREVIEW": True,
     "MAX_PER_KEYWORD": 10,
     "PAGE_SIZE": 30,
+    "CREDENTIALS": {}
 }
 
 # =========================
@@ -79,7 +76,7 @@ def load_config(path: str = CONFIG_PATH) -> Dict:
     cfg = DEFAULT_CONFIG.copy()
     file_cfg = read_json(path, default=None)
     if file_cfg is None:
-        logging.warning("config.json not found. Using DEFAULT_CONFIG.")
+        logging.warning("config.json not found. Using DEFAULT_CONFIG. path=%s", path)
         return cfg
     cfg.update(file_cfg)
     return cfg
@@ -87,11 +84,12 @@ def load_config(path: str = CONFIG_PATH) -> Dict:
 CONFIG = load_config()
 
 def get_secret(key: str, default: str = "") -> str:
-    # secrets.toml 없을 수 있으니 예외 안전
-    try:
-        return st.secrets.get(key, default)
-    except Exception:
-        return os.environ.get(key, default)
+    """환경변수 → config.json(CREDENTIALS) 순으로 조회."""
+    env_val = os.environ.get(key)
+    if env_val:
+        return env_val
+    creds = CONFIG.get("CREDENTIALS", {})
+    return creds.get(key, default)
 
 def now_utc() -> datetime:
     return datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -105,7 +103,6 @@ TRACKING_PARAMS = {
     "utm_source","utm_medium","utm_campaign","utm_term","utm_content",
     "inflow","sid","oid","aid","mode","ref","feature","from"
 }
-
 def normalize_url(u: str) -> str:
     u = (u or "").strip().replace("http://", "https://")
     try:
@@ -139,7 +136,7 @@ def hours_ago(iso_str: str) -> float:
     return (now_utc() - iso_to_dt(iso_str)).total_seconds() / 3600.0
 
 # =========================
-# 데이터 모델 & 공급자
+# 데이터 모델/공급자
 # =========================
 @dataclass
 class Article:
@@ -214,9 +211,7 @@ def title_key(title: str) -> str:
 def is_similar(t1: str, t2: str, threshold: float = 0.86) -> bool:
     return SequenceMatcher(None, title_key(t1), title_key(t2)).ratio() >= threshold
 
-def dedup_by_title(articles: List[Article],
-                   score_fn) -> List[Article]:
-    """유사 타이틀을 군집화하여 대표 1건만 남긴다."""
+def dedup_by_title(articles: List[Article], score_fn) -> List[Article]:
     reps: List[Article] = []
     for a in articles:
         dup = False
@@ -276,11 +271,10 @@ def compose_message(keyword: str, articles: List[Article]) -> str:
         lines.append(
             f"• <a href=\"{a.url}\">{html_unescape(a.title)}</a> — <i>{a.source}</i> ({dt})"
         )
-    # Telegram 메시지 제한 4096 → 넉넉히 4000자
-    return "\n".join(lines)[:4000]
+    return "\n".join(lines)[:4000]  # 텔레그램 4096자 제한 가드
 
 # =========================
-# Streamlit 초기 상태
+# Streamlit 상태
 # =========================
 if "scheduler" not in st.session_state:
     st.session_state.scheduler = None
@@ -294,10 +288,11 @@ st.title("📨 PE 동향 뉴스 → Telegram 자동 전송")
 st.caption("키워드는 전부 config.json에서 관리합니다.")
 
 # =========================
-# Sidebar (자격/설정 + config 리로드)
+# Sidebar
 # =========================
 with st.sidebar:
     st.subheader("자격증명 / 설정")
+    st.caption(f"CONFIG 경로: {CONFIG_PATH} / 존재: {os.path.isfile(CONFIG_PATH)}")
 
     newsapi_key = st.text_input("NewsAPI Key (선택)", value=get_secret("NEWSAPI_KEY"), type="password")
     naver_client_id = st.text_input("Naver Client ID (선택)", value=get_secret("NAVER_CLIENT_ID"), type="password")
@@ -308,17 +303,14 @@ with st.sidebar:
 
     st.divider()
     st.subheader("config.json")
-    st.caption(f"로드 경로: {CONFIG_PATH}")
-
     if st.button("구성 리로드"):
+        global CONFIG
         CONFIG = load_config()
         st.success("config.json을 다시 불러왔습니다.")
 
-    # 읽기 전용 표시
     st.text("KEYWORDS (읽기전용)")
     st.code("\n".join(CONFIG.get("KEYWORDS", [])) or "(none)", language="text")
 
-    # 운영상 편의를 위한 덮어쓰기 옵션 (필요 시 UI로 실험)
     def csv(v): return ", ".join([x for x in v if isinstance(x, str)])
     page_size        = st.number_input("페이지당 수집 수", min_value=5, max_value=100, value=int(CONFIG.get("PAGE_SIZE", 30)), step=5)
     max_per_keyword  = st.number_input("전송 건수 제한(키워드별)", min_value=1, max_value=50, value=int(CONFIG.get("MAX_PER_KEYWORD", 10)), step=1)
@@ -341,7 +333,6 @@ block_domains = csv_to_list(block_domains_txt)
 include_terms = csv_to_list(include_terms_txt)
 exclude_terms = csv_to_list(exclude_terms_txt)
 
-# 설정에서 읽어오는 가중치/워치리스트
 DOMAIN_WEIGHTS = CONFIG.get("DOMAIN_WEIGHTS", {})
 FIRM_WATCH = [s.lower() for s in CONFIG.get("FIRM_WATCHLIST", [])]
 
@@ -357,10 +348,9 @@ if not providers:
     st.warning("최소 하나의 뉴스 제공자(NewsAPI 또는 Naver)를 설정하세요.")
 
 # =========================
-# 수집 / 정제 파이프라인
+# 수집 파이프라인
 # =========================
 def expand_queries(kw: str) -> List[str]:
-    """config의 KEYWORD_ALIASES로 동의어 확장. 영문/일반어는 보정 토큰 추가."""
     aliases = CONFIG.get("KEYWORD_ALIASES", {}).get(kw, [])
     base = [kw] + [a for a in aliases if a != kw]
     enriched: List[str] = []
@@ -370,9 +360,7 @@ def expand_queries(kw: str) -> List[str]:
             enriched.append(f"{q} AND (인수 OR 매각 OR 딜 OR PEF)")
         else:
             enriched.append(q)
-    # 중복 제거
-    seen = set()
-    uniq = []
+    seen = set(); uniq=[]
     for q in enriched:
         if q not in seen:
             uniq.append(q); seen.add(q)
@@ -391,10 +379,9 @@ def fetch_articles(providers: List[NewsProvider], query: str, page_size: int) ->
     return list(agg.values())
 
 def score_article(a: Article) -> float:
-    """도메인 가중치 + 신선도 + 포함/제외어 + 워치리스트 반영 점수"""
     score = DOMAIN_WEIGHTS.get(domain_of(a.url), 0.0)
     h = max(0.0, min(48.0, hours_ago(a.published_at)))
-    score += (48.0 - h) / 48.0 * 2.0  # 최신일수록 가점
+    score += (48.0 - h) / 48.0 * 2.0  # 최신 가점
     title = html_unescape(a.title).lower()
     if any(t for t in include_terms if t in title):
         score += 1.0
@@ -425,12 +412,10 @@ def do_run_once() -> Tuple[int, int]:
 
     keywords = CONFIG.get("KEYWORDS", [])
     for kw in [k.strip() for k in keywords if k.strip()]:
-        # 1) 동의어 확장 쿼리로 수집
         raw: List[Article] = []
         for q in expand_queries(kw):
-            raw.extend(fetch_articles(providers, q, page_size=int(page_size)))
+            raw.extend(fetch_articles(providers, q, page_size=int(CONFIG.get("PAGE_SIZE", 30))))
 
-        # 2) URL 기준 중복 제거(재확인)
         url_seen: Dict[str, Article] = {}
         for a in raw:
             u = normalize_url(a.url)
@@ -438,40 +423,43 @@ def do_run_once() -> Tuple[int, int]:
                 url_seen[u] = a
         raw = list(url_seen.values())
 
-        # 3) 필터(도메인/제외어/신선도)
         filt = [a for a in raw if should_keep(
-            a, allow_domains, block_domains, include_terms, exclude_terms, int(recency_hours)
+            a,
+            allow_domains,
+            block_domains,
+            include_terms,
+            exclude_terms,
+            int(CONFIG.get("RECENCY_HOURS", 48))
         )]
 
-        # 4) 유사 타이틀 군집화
         filt = dedup_by_title(filt, score_article)
 
-        # 5) 랭킹
         ranked = sorted(
             filt,
             key=lambda x: (score_article(x), x.published_at),
             reverse=True
         )
 
-        # 6) 아직 보내지 않은 것만 선택
         new_arts: List[Article] = []
         for a in ranked:
             if a.url in sent_db:
                 continue
             new_arts.append(a)
-            if len(new_arts) >= int(max_per_keyword):
+            if len(new_arts) >= int(CONFIG.get("MAX_PER_KEYWORD", 10)):
                 break
 
         if not new_arts:
             continue
 
-        # 7) 전송
         msg = compose_message(kw, new_arts)
         try:
             if test_mode:
                 logging.info("[TEST MODE] Would send %d items for '%s'", len(new_arts), kw)
             else:
-                send_telegram_message(telegram_bot_token, telegram_chat_id, msg, disable_web_page_preview=disable_preview)
+                send_telegram_message(
+                    telegram_bot_token, telegram_chat_id, msg,
+                    disable_web_page_preview=bool(CONFIG.get("TELEGRAM_DISABLE_PREVIEW", True))
+                )
             kw_sent_cnt += 1
             total_sent += len(new_arts)
             for a in new_arts:
@@ -479,7 +467,6 @@ def do_run_once() -> Tuple[int, int]:
         except Exception as e:
             st.error(f"텔레그램 전송 실패 ({kw}): {e}")
 
-        # 전송 직후 저장
         write_json(SENT_DB_PATH, sent_db)
 
     return kw_sent_cnt, total_sent
@@ -494,7 +481,6 @@ def ensure_scheduler():
 
 def start_schedule(every_minutes: int):
     ensure_scheduler()
-    # 기존 잡 제거
     for job in st.session_state.scheduler.get_jobs():
         st.session_state.scheduler.remove_job(job.id)
     st.session_state.scheduler.add_job(
@@ -528,11 +514,11 @@ with c1:
     if st.button("지금 한 번 실행"):
         k, t = do_run_once()
         st.session_state.last_run = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.success(f"완료: {k}개 키워드, {t}건 기사 처리{' (전송 생략: 테스트 모드)' if test_mode else ''}")
+        st.success(f"완료: {k}개 키워드, {t}건 기사 처리{' (전송 생략: 테스트 모드)' if st.session_state.get('test_mode', False) else ''}")
 with c2:
     if st.button("스케줄 시작"):
-        start_schedule(int(interval_min))
-        st.success(f"스케줄 시작: {interval_min}분 간격")
+        start_schedule(60)  # 기본 60분 (사이드바 interval_min을 사용하려면 연결)
+        st.success("스케줄 시작")
 with c3:
     if st.button("스케줄 중지"):
         stop_schedule()
@@ -552,14 +538,18 @@ if providers and CONFIG.get("KEYWORDS"):
         for q in expand_queries(first_kw):
             preview.extend(fetch_articles(providers, q, page_size=int(CONFIG.get("PAGE_SIZE", 30))))
 
-        # 동일 파이프라인 간소화 버전
         url_seen = {}
         for a in preview:
             u = normalize_url(a.url)
             if u and u not in url_seen:
                 url_seen[u] = a
         preview = list(url_seen.values())
-        preview = [a for a in preview if should_keep(a, allow_domains, block_domains, include_terms, exclude_terms, int(recency_hours))]
+        preview = [a for a in preview if should_keep(
+            a, csv_to_list(""), csv_to_list(",".join(CONFIG.get("BLOCK_DOMAINS", []))),
+            csv_to_list(",".join(CONFIG.get("INCLUDE_TITLE_KEYWORDS", []))),
+            csv_to_list(",".join(CONFIG.get("EXCLUDE_TITLE_KEYWORDS", []))),
+            int(CONFIG.get("RECENCY_HOURS", 48))
+        )]
         preview = dedup_by_title(preview, score_article)
         preview = sorted(preview, key=lambda x: (score_article(x), x.published_at), reverse=True)[:10]
 
