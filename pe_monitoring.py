@@ -17,8 +17,18 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# ---------- Utilities ----------
+# ---------- Secrets/Env helper ----------
+def get_secret(key: str, default: str = "") -> str:
+    """
+    secrets.toml(st.secrets) → 환경변수(os.environ) → default 순으로 읽는다.
+    Render에서 Secret Files가 없어도 Environment Variables만으로 동작하도록 함.
+    """
+    try:
+        return st.secrets.get(key, default)  # secrets.toml이 없으면 여기서 예외 가능
+    except Exception:
+        return os.environ.get(key, default)
 
+# ---------- Utilities ----------
 def read_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -180,7 +190,6 @@ def fetch_articles(providers: List[NewsProvider], keyword: str, page_size: int) 
                     )
         except Exception as e:
             logging.warning("Provider fetch error (%s): %s", p.__class__.__name__, e)
-
     return sorted(agg.values(), key=lambda x: x.published_at, reverse=True)
 
 def filter_unsent(articles: List[Article], sent_db: Dict[str, bool], max_items: int) -> List[Article]:
@@ -202,17 +211,17 @@ if "last_run" not in st.session_state:
     st.session_state.last_run = None
 
 st.set_page_config(page_title="PE 동향 뉴스 → Telegram", page_icon="📨", layout="wide")
-
 st.title("📨 PE 동향 뉴스 → Telegram 자동 전송")
 st.caption("Streamlit + NewsAPI/Naver + Telegram + APScheduler")
 
 with st.sidebar:
     st.subheader("자격증명 / 설정")
-    default_newsapi = st.secrets.get("NEWSAPI_KEY", "") if hasattr(st, "secrets") else ""
-    default_naver_id = st.secrets.get("NAVER_CLIENT_ID", "") if hasattr(st, "secrets") else ""
-    default_naver_secret = st.secrets.get("NAVER_CLIENT_SECRET", "") if hasattr(st, "secrets") else ""
-    default_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "") if hasattr(st, "secrets") else ""
-    default_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "") if hasattr(st, "secrets") else ""
+    # secrets.toml 또는 환경변수에서 기본값 로드
+    default_newsapi      = get_secret("NEWSAPI_KEY")
+    default_naver_id     = get_secret("NAVER_CLIENT_ID")
+    default_naver_secret = get_secret("NAVER_CLIENT_SECRET")
+    default_bot_token    = get_secret("TELEGRAM_BOT_TOKEN")
+    default_chat_id      = get_secret("TELEGRAM_CHAT_ID")
 
     newsapi_key = st.text_input("NewsAPI Key (선택)", value=default_newsapi, type="password")
     naver_client_id = st.text_input("Naver Client ID (선택)", value=default_naver_id, type="password")
