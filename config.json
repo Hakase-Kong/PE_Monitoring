@@ -29,7 +29,9 @@
     "news.naver.com", "n.news.naver.com",
     "www.thebell.co.kr", "www.investchosun.com", "dealsite.co.kr"
   ],
-  "BLOCK_DOMAINS": ["sports.naver.com", "m.sports.naver.com"],
+  "BLOCK_DOMAINS": [
+    "sports.naver.com", "m.sports.naver.com"
+  ],
 
   "INCLUDE_TITLE_KEYWORDS": [
     "PE", "사모펀드", "바이아웃", "인수", "매각", "M&A",
@@ -59,17 +61,8 @@
 
   "RECENCY_HOURS": 48,
   "ONLY_WORKING_HOURS": true,
-  "SKIP_WEEKENDS": true,
-  "SKIP_HOLIDAYS": true,
-  "HOLIDAYS_KR": [
-    "2025-01-01", "2025-02-28"
-  ],
-
   "TELEGRAM_DISABLE_PREVIEW": true,
-  "PAGE_SIZE": 30,
   "MAX_PER_KEYWORD": 10,
-
-  "AGGREGATE_MODE": true,
-  "MAX_OVERALL": 10,
+  "PAGE_SIZE": 30,
   "TRANSMIT_INTERVAL_MIN": 60
 }

@@ -1,9 +1,12 @@
 import os
 import re
 import json
+import time
+import math
+import queue
 import string
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import requests
@@ -12,7 +15,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from zoneinfo import ZoneInfo
 
 # =========================
-# 전역 상태
+# 전역 상태 (런타임 교차 중복 제거)
 # =========================
 RUN_SEEN_URLS = set()
 RUN_SEEN_TITLES = set()
@@ -29,31 +32,19 @@ def now_kst():
 def normalize_title(t: str) -> str:
     t = t.lower().strip()
     t = re.sub(r"\s+", " ", t)
-    # 기본 구두점 제거
-    return t.translate(str.maketrans("", "", string.punctuation + "“”‘’"))
+    t = t.translate(str.maketrans("", "", string.punctuation + "“”‘’"))
+    return t
 
-def get_domain(url):
-    try:
-        return urlparse(url).netloc.lower()
-    except Exception:
-        return ""
-
-def title_has_any(title, words):
-    tl = title.lower()
-    return any(w.lower() in tl for w in words)
-
-def to_bool(v, default=False):
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, str):
-        return v.lower() in ["1", "true", "yes", "y", "on"]
-    return default
+def within_working_hours():
+    # 08~20 KST
+    h = now_kst().hour
+    return 8 <= h < 20
 
 def get_config_path():
     candidates = [
         os.environ.get("CONFIG_PATH"),
         "/opt/render/project/src/config.json",  # Render 기본 경로
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "config.json")),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "config.json"))
     ]
     for p in candidates:
         if p and os.path.exists(p):
@@ -75,97 +66,128 @@ def load_config():
 def env_ok(env_name):
     return bool(os.environ.get(env_name, "").strip())
 
-# 근무시간/휴일 정책
-def is_weekend(dt):
-    return dt.weekday() >= 5  # 5=토, 6=일
+def to_bool(v, default=False):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.lower() in ["1","true","yes","y","on"]
+    return default
 
-def is_holiday(dt, cfg):
-    days = set(cfg.get("HOLIDAYS_KR", []))
-    return dt.strftime("%Y-%m-%d") in days
+def get_domain(url):
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ""
 
-def within_send_window(cfg):
-    if not to_bool(cfg.get("ONLY_WORKING_HOURS", True), True):
-        return True
-    now = now_kst()
-    hour_ok = 8 <= now.hour < 20
-    if not hour_ok:
-        return False
-    if to_bool(cfg.get("SKIP_WEEKENDS", True), True) and is_weekend(now):
-        return False
-    if to_bool(cfg.get("SKIP_HOLIDAYS", True), True) and is_holiday(now, cfg):
-        return False
-    return True
+def title_has_any(title, words):
+    t = title.lower()
+    return any(w.lower() in t for w in words)
 
-# 점수
 def score_item(item, cfg):
+    """도메인 가중치 + 워치리스트 + 최신성 스코어"""
     score = 0.0
-    # 도메인 가중치
+    domain = get_domain(item["link"])
     weights = cfg.get("DOMAIN_WEIGHTS", {})
-    score += float(weights.get(get_domain(item["link"]), 1.0))
+    score += float(weights.get(domain, 1.0))
+
     # 워치리스트 부스트
     if title_has_any(item["title"], cfg.get("FIRM_WATCHLIST", [])):
         score += 1.5
-    # 최신성 가점(24h 이내 최대 +2)
+
+    # 최신성(가까울수록 가점)
     if item.get("pub_dt"):
         hrs = (now_kst() - item["pub_dt"]).total_seconds() / 3600.0
-        score += max(0.0, 2.0 - (hrs / 24.0))
+        score += max(0.0, 2.0 - (hrs / 24.0))  # 24h 이내면 최대 +2 → 점차 감소
     return score
 
 # =========================
-# 수집기
+# 뉴스 수집기
 # =========================
 def search_naver_news(query, display=30):
+    """
+    Naver Search API (뉴스)
+    ENV: NAVER_CLIENT_ID, NAVER_CLIENT_SECRET
+    """
     cid = os.environ.get("NAVER_CLIENT_ID", "")
     csc = os.environ.get("NAVER_CLIENT_SECRET", "")
     if not cid or not csc:
         return []
+
     url = "https://openapi.naver.com/v1/search/news.json"
-    headers = {"X-Naver-Client-Id": cid, "X-Naver-Client-Secret": csc}
-    params = {"query": query, "display": min(display, 100), "start": 1, "sort": "date"}
+    headers = {
+        "X-Naver-Client-Id": cid,
+        "X-Naver-Client-Secret": csc,
+    }
+    params = {
+        "query": query,
+        "display": min(display, 100),
+        "start": 1,
+        "sort": "date",
+    }
     try:
         r = requests.get(url, headers=headers, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
-        out = []
+        items = []
         for it in data.get("items", []):
+            # 일부 결과는 originallink가 없기도 함
             link = it.get("link") or it.get("originallink") or ""
             title = re.sub("<.*?>", "", it.get("title", ""))
             desc = re.sub("<.*?>", "", it.get("description", ""))
+            # Naver는 pubDate 예: 'Fri, 03 Oct 2025 08:20:00 +0900'
+            pub_dt = None
             try:
-                pub_dt = datetime.strptime(it.get("pubDate", ""), "%a, %d %b %Y %H:%M:%S %z").astimezone(KST)
+                pub_dt = datetime.strptime(it.get("pubDate",""), "%a, %d %b %Y %H:%M:%S %z").astimezone(KST)
             except Exception:
                 pub_dt = now_kst()
-            out.append({"title": title, "desc": desc, "link": link, "source": "Naver", "pub_dt": pub_dt})
-        return out
+            items.append({
+                "title": title,
+                "desc": desc,
+                "link": link,
+                "source": "Naver",
+                "pub_dt": pub_dt
+            })
+        return items
     except Exception:
         return []
 
 def search_newsapi(query, page_size=30):
+    """
+    NewsAPI (선택)
+    ENV: NEWSAPI_KEY
+    """
     key = os.environ.get("NEWSAPI_KEY", "")
     if not key:
         return []
     url = "https://newsapi.org/v2/everything"
     from_dt = (now_kst() - timedelta(hours=72)).strftime("%Y-%m-%dT%H:%M:%S")
-    params = {"q": query, "pageSize": min(page_size, 100), "from": from_dt,
-              "language": "ko", "sortBy": "publishedAt", "apiKey": key}
+    params = {
+        "q": query,
+        "pageSize": min(page_size, 100),
+        "from": from_dt,
+        "language": "ko",
+        "sortBy": "publishedAt",
+        "apiKey": key
+    }
     try:
         r = requests.get(url, params=params, timeout=12)
         r.raise_for_status()
         data = r.json()
-        out = []
+        items = []
         for a in data.get("articles", []):
+            pub = a.get("publishedAt")
             try:
-                pub_dt = datetime.fromisoformat(a.get("publishedAt","").replace("Z","+00:00")).astimezone(KST)
+                pub_dt = datetime.fromisoformat(pub.replace("Z","+00:00")).astimezone(KST)
             except Exception:
                 pub_dt = now_kst()
-            out.append({
+            items.append({
                 "title": a.get("title",""),
                 "desc": a.get("description",""),
                 "link": a.get("url",""),
                 "source": a.get("source",{}).get("name","NewsAPI"),
                 "pub_dt": pub_dt
             })
-        return out
+        return items
     except Exception:
         return []
 
@@ -173,30 +195,52 @@ def search_newsapi(query, page_size=30):
 # 필터링/집계
 # =========================
 def filter_and_rank(items, cfg):
-    # 1) 제목 제외
-    ex = cfg.get("EXCLUDE_TITLE_KEYWORDS", [])
-    items = [x for x in items if not title_has_any(x["title"], ex)]
-    # 2) 도메인 차단/허용
+    # 1) 제목 제외 키워드
+    ex_words = cfg.get("EXCLUDE_TITLE_KEYWORDS", [])
+    items = [x for x in items if not title_has_any(x["title"], ex_words)]
+
+    # 2) 포함 키워드(있으면 +, 없으면 통과 — 너무 강하게 제한하지 않음)
+    inc_words = cfg.get("INCLUDE_TITLE_KEYWORDS", [])
+    if inc_words:
+        kept = []
+        for x in items:
+            # 포함 단어가 있으면 약간 우선시(뒤 스코어링에서 반영), 여기서는 걸러내지 않음
+            kept.append(x)
+        items = kept
+
+    # 3) 도메인 허용/차단
     allow = set([d.lower() for d in cfg.get("ALLOW_DOMAINS", [])])
     block = set([d.lower() for d in cfg.get("BLOCK_DOMAINS", [])])
     strict = to_bool(cfg.get("ALLOWLIST_STRICT", False), False)
+
+    # 기본: 차단 도메인만 제외, ALLOW는 가중치/선호 역할 (해외 소스 포함)
     if strict and allow:
         items = [x for x in items if get_domain(x["link"]) in allow]
+    # 항상 차단 목록은 제거
     items = [x for x in items if get_domain(x["link"]) not in block]
-    # 3) 신선도
+
+    # 4) 최신성
     recency_h = int(cfg.get("RECENCY_HOURS", 48))
-    since = now_kst() - timedelta(hours=recency_h)
-    items = [x for x in items if not x.get("pub_dt") or x["pub_dt"] >= since]
-    # 4) 실행 내 중복 제거(제목/URL)
-    seen_u, seen_t, uniq = set(), set(), []
+    since_ts = now_kst() - timedelta(hours=recency_h)
+    items = [x for x in items if not x.get("pub_dt") or x["pub_dt"] >= since_ts]
+
+    # 5) 실행 내 중복제거 (URL/제목)
+    seen_url = set()
+    seen_title = set()
+    uniq = []
     for x in items:
         u = x["link"].strip()
         t = normalize_title(x["title"])
-        if u in seen_u or t in seen_t:
+        if u in seen_url: 
             continue
-        seen_u.add(u); seen_t.add(t); uniq.append(x)
+        if t in seen_title:
+            continue
+        seen_url.add(u)
+        seen_title.add(t)
+        uniq.append(x)
     items = uniq
-    # 5) 실행 간 중복 제거(전역)
+
+    # 6) 실행 간(글로벌) 중복제거
     global RUN_SEEN_URLS, RUN_SEEN_TITLES
     tmp = []
     for x in items:
@@ -206,60 +250,49 @@ def filter_and_rank(items, cfg):
             continue
         tmp.append(x)
     items = tmp
-    # 6) 스코어링
+
+    # 7) 스코어링 정렬
     items.sort(key=lambda z: score_item(z, cfg), reverse=True)
     return items
 
 def make_batches(cfg):
+    """키워드별 검색 -> 필터/랭크 -> 키워드 간 교차중복 제거"""
     keywords = cfg.get("KEYWORDS", [])
     aliases = cfg.get("KEYWORD_ALIASES", {})
     page_size = int(cfg.get("PAGE_SIZE", 30))
-    max_per = int(cfg.get("MAX_PER_KEYWORD", 10))
+    max_per_key = int(cfg.get("MAX_PER_KEYWORD", 10))
 
     picked_by_bucket = {}
-    cross_seen_u, cross_seen_t = set(), set()
+    cross_seen_u = set()
+    cross_seen_t = set()
 
     for bucket in keywords:
-        q_terms = [bucket] + aliases.get(bucket, [])
-        q = " OR ".join(list(dict.fromkeys(q_terms)))
+        q_terms = [bucket]
+        q_terms += aliases.get(bucket, [])
+        q = " OR ".join(list(dict.fromkeys(q_terms)))  # dup 제거
+
         raw = []
+        # Naver 우선
         raw += search_naver_news(q, display=page_size)
+        # 이후 NewsAPI 보강(있으면)
         raw += search_newsapi(q, page_size=page_size)
 
         filtered = filter_and_rank(raw, cfg)
 
-        # 버킷 간 교차 중복 제거
+        # 키워드 간 교차 중복 제거
         deduped = []
         for it in filtered:
             u = it["link"].strip()
             t = normalize_title(it["title"])
             if u in cross_seen_u or t in cross_seen_t:
                 continue
-            cross_seen_u.add(u); cross_seen_t.add(t)
+            cross_seen_u.add(u)
+            cross_seen_t.add(t)
             deduped.append(it)
-        picked_by_bucket[bucket] = deduped[:max_per]
-    return picked_by_bucket
 
-def aggregate_top_k(batches, cfg):
-    """버킷 전체를 합쳐 상위 K개로 정렬"""
-    K = int(cfg.get("MAX_OVERALL", 10))
-    flat = []
-    for arr in batches.values():
-        for it in arr:
-            flat.append((score_item(it, cfg), it))
-    flat.sort(key=lambda x: x[0], reverse=True)
-    top = []
-    seen_u, seen_t = set(), set()
-    for _, it in flat:
-        u = it["link"].strip()
-        t = normalize_title(it["title"])
-        if u in seen_u or t in seen_t:
-            continue
-        seen_u.add(u); seen_t.add(t)
-        top.append(it)
-        if len(top) >= K:
-            break
-    return top
+        picked_by_bucket[bucket] = deduped[:max_per_key]
+
+    return picked_by_bucket
 
 # =========================
 # Telegram
@@ -285,75 +318,49 @@ def send_telegram_message(text, disable_preview=True):
     except Exception as e:
         return False, str(e)
 
-def display_source(it):
-    d = get_domain(it.get("link",""))
-    return d or (it.get("source") or "")
-
-def format_overall_message(items):
-    if not items: return None
-    lines = ["📌 PE 동향 뉴스 (Top 10)"]
-    for it in items:
-        when = it.get("pub_dt")
-        ts = when.strftime("%Y-%m-%d %H:%M") if when else ""
-        src = display_source(it)
-        lines.append(f"• {it['title']} ({it['link']}) — {src} ({ts})")
-    return "\n".join(lines)
-
 def format_bucket_message(bucket, items):
-    if not items: return None
+    if not items:
+        return None
     lines = [f"📌 PE 동향 뉴스 ({bucket})"]
     for it in items[:10]:
+        src = it.get("source","")
         when = it.get("pub_dt")
         ts = when.strftime("%Y-%m-%d %H:%M") if when else ""
-        src = display_source(it)
         lines.append(f"• {it['title']} ({it['link']}) — {src} ({ts})")
     return "\n".join(lines)
 
 def transmit_once(cfg, preview=False, ignore_hours=False):
     global RUN_SEEN_URLS, RUN_SEEN_TITLES, last_run_info
 
-    # 근무시간/휴일 제한 (스케줄러에서만 적용)
-    if not ignore_hours and not within_send_window(cfg):
-        last_run_info = {"ts": now_kst(), "sent": 0, "picked": 0, "note": "off_hours_or_holiday"}
-        return {"picked": 0, "sent": 0, "skipped": "off_hours_or_holiday"}
+    # 근무시간 제한
+    if to_bool(cfg.get("ONLY_WORKING_HOURS", False), False) and not ignore_hours:
+        last_run_info = {"ts": now_kst(), "sent": 0, "picked": 0, "note": "off_hours"}
+        return {"picked": 0, "sent": 0, "skipped": "off_hours"}
 
     batches = make_batches(cfg)
     disable_preview = to_bool(cfg.get("TELEGRAM_DISABLE_PREVIEW", True), True)
 
-    # 집계 모드 여부
-    aggregate = to_bool(cfg.get("AGGREGATE_MODE", True), True)
-
-    if aggregate:
-        top = aggregate_top_k(batches, cfg)
-        total_picked = len(top)
-        total_sent = 0
-        if not preview:
-            # 전역 중복 리스트 업데이트
-            for it in top:
-                RUN_SEEN_URLS.add(it["link"].strip())
-                RUN_SEEN_TITLES.add(normalize_title(it["title"]))
-            msg = format_overall_message(top)
-            if msg:
-                ok, err = send_telegram_message(msg, disable_preview=disable_preview)
-                if ok: total_sent = len(top)
-                else: last_run_info = {"ts": now_kst(), "sent": total_sent, "picked": total_picked, "note": f"TG_FAIL:{err}"}
-        last_run_info = {"ts": now_kst(), "sent": total_sent, "picked": total_picked, "note": ""}
-        return {"picked": total_picked, "sent": total_sent, "skipped": None}
-
-    # (비집계 모드) 버킷별 전송
     total_picked = sum(len(v) for v in batches.values())
     total_sent = 0
+
     if not preview:
+        # 실행 간 중복 기록 업데이트
         for arr in batches.values():
             for it in arr:
                 RUN_SEEN_URLS.add(it["link"].strip())
                 RUN_SEEN_TITLES.add(normalize_title(it["title"]))
+
+        # 전송
         for bucket, arr in batches.items():
             msg = format_bucket_message(bucket, arr)
-            if not msg: continue
+            if not msg:
+                continue
             ok, err = send_telegram_message(msg, disable_preview=disable_preview)
-            if ok: total_sent += len(arr)
-            else: last_run_info = {"ts": now_kst(), "sent": total_sent, "picked": total_picked, "note": f"TG_FAIL:{err}"}
+            if ok:
+                total_sent += len(arr)
+            else:
+                # 전송 실패 시에도 에러 내용을 상태에 남김
+                last_run_info = {"ts": now_kst(), "sent": total_sent, "picked": total_picked, "note": f"TG_FAIL:{err}"}
 
     last_run_info = {"ts": now_kst(), "sent": total_sent, "picked": total_picked, "note": ""}
     return {"picked": total_picked, "sent": total_sent, "skipped": None}
@@ -404,32 +411,34 @@ with st.sidebar:
     st.divider()
     st.markdown("### config.json")
     if cfg:
-        st.button("구성 리로드", on_click=lambda: load_config.clear())
+        st.button("구성 리로드", on_click=lambda: load_config.clear())  # cache 초기화
         st.write("**KEYWORDS (읽기전용)**")
         st.code(", ".join(cfg.get("KEYWORDS", [])) or "(none)")
-        st.number_input("페이지당 수집 수", 5, 100, int(cfg.get("PAGE_SIZE", 30)), 5, key="ps", disabled=True)
-        st.number_input("전송 건수 제한(키워드별)", 1, 50, int(cfg.get("MAX_PER_KEYWORD", 10)), 1, key="mx", disabled=True)
-        st.number_input("전송 주기(분)", 10, 360, int(cfg.get("TRANSMIT_INTERVAL_MIN", 60)), 10, key="iv", disabled=True)
-        st.number_input("신선도(최근 N시간)", 6, 168, int(cfg.get("RECENCY_HOURS", 48)), 6, key="rc", disabled=True)
+        st.number_input("페이지당 수집 수", min_value=5, max_value=100, step=5,
+                        value=int(cfg.get("PAGE_SIZE", 30)), key="ps", disabled=True)
+        st.number_input("전송 건수 제한(키워드별)", min_value=1, max_value=50, step=1,
+                        value=int(cfg.get("MAX_PER_KEYWORD", 10)), key="mx", disabled=True)
+        st.number_input("전송 주기(분)", min_value=10, max_value=360, step=10,
+                        value=int(cfg.get("TRANSMIT_INTERVAL_MIN", 60)), key="iv", disabled=True)
+        st.number_input("신선도(최근 N시간)", min_value=6, max_value=168, step=6,
+                        value=int(cfg.get("RECENCY_HOURS", 48)), key="rc", disabled=True)
         st.checkbox("업무시간(08~20 KST) 내 전송", value=to_bool(cfg.get("ONLY_WORKING_HOURS", True)), disabled=True)
-        st.checkbox("주말 미전송", value=to_bool(cfg.get("SKIP_WEEKENDS", True)), disabled=True)
-        st.checkbox("공휴일 미전송", value=to_bool(cfg.get("SKIP_HOLIDAYS", True)), disabled=True)
         st.checkbox("링크 프리뷰 비활성화", value=to_bool(cfg.get("TELEGRAM_DISABLE_PREVIEW", True)), disabled=True)
-        st.checkbox("집계 모드(Top-K 단일 메시지)", value=to_bool(cfg.get("AGGREGATE_MODE", True)), disabled=True)
+        st.checkbox("ALLOWLIST_STRICT (허용 도메인만 통과)", value=to_bool(cfg.get("ALLOWLIST_STRICT", False)), disabled=True)
     else:
         st.error("config.json을 읽을 수 없습니다. 경로/JSON 문법을 확인하세요.")
 
 st.title("📬 PE 동향 뉴스 → Telegram 자동 전송")
-st.caption("Streamlit + Naver/NewsAPI + Telegram + APScheduler")
+st.caption("Streamlit + NewsAPI/Naver + Telegram + APScheduler")
 
 col1, col2, col3, col4 = st.columns([1,1,1,1])
 with col1:
-    if st.button("지금 한 번 실행(미리보기)", use_container_width=True):
+    if st.button("지금 한 번 실행", use_container_width=True):
         if not cfg:
             st.error("config.json을 불러오지 못했습니다.")
         else:
             res = transmit_once(cfg, preview=True, ignore_hours=True)
-            st.success(f"완료: {res['picked']}건 미리보기, 0건 전송(미리보기)")
+            st.success(f"완료: {res['picked']}건 미리보기, {0}건 전송(미리보기)")
 with col2:
     if st.button("지금 한 번 전송", use_container_width=True):
         if not cfg:
@@ -451,32 +460,27 @@ with col4:
 
 st.divider()
 st.subheader("상태")
+
 st.write(f"Scheduler 실행 중: **{scheduler_running()}**")
 if last_run_info["ts"]:
-    note = f" (note: {last_run_info['note']})" if last_run_info.get("note") else ""
-    st.write(f"마지막 수행 시각: **{last_run_info['ts'].strftime('%Y-%m-%d %H:%M:%S')}** / 선별: {last_run_info['picked']} / 전송: {last_run_info['sent']}{note}")
+    msg_note = f" (note: {last_run_info['note']})" if last_run_info.get("note") else ""
+    st.write(f"마지막 수행 시각: **{last_run_info['ts'].strftime('%Y-%m-%d %H:%M:%S')}** / 선별: {last_run_info['picked']} / 전송: {last_run_info['sent']}{msg_note}")
+st.info("config.json의 KEYWORDS가 비어 있습니다." if (cfg and not cfg.get("KEYWORDS")) else "")
 
-# 미리보기
+# 미리보기 블록
 if cfg:
-    st.subheader("미리보기")
-    preview_batches = make_batches(cfg)
-    if to_bool(cfg.get("AGGREGATE_MODE", True), True):
-        top = aggregate_top_k(preview_batches, cfg)
-        with st.expander(f"Top {int(cfg.get('MAX_OVERALL',10))} — {len(top)}건", expanded=True):
-            if not top:
+    st.subheader("미리보기: 최신 10건")
+    preview = make_batches(cfg)
+    # 키워드 섹션별로 상위 10개만 표시
+    for bucket in cfg.get("KEYWORDS", []):
+        items = preview.get(bucket, [])[:10]
+        with st.expander(f"{bucket} — {len(items)}건", expanded=False):
+            if not items:
                 st.caption("결과 없음")
-            for it in top:
+            for it in items:
                 ts = it["pub_dt"].strftime("%Y-%m-%d %H:%M") if it.get("pub_dt") else ""
-                src = display_source(it)
-                st.markdown(f"- [{it['title']}]({it['link']})  \n"
-                            f"  <span style='font-size:12px;color:#888'>{src} — {ts}</span>", unsafe_allow_html=True)
-    else:
-        for bucket, arr in preview_batches.items():
-            with st.expander(f"{bucket} — {len(arr[:10])}건", expanded=False):
-                if not arr:
-                    st.caption("결과 없음")
-                for it in arr[:10]:
-                    ts = it["pub_dt"].strftime("%Y-%m-%d %H:%M") if it.get("pub_dt") else ""
-                    src = display_source(it)
-                    st.markdown(f"- [{it['title']}]({it['link']})  \n"
-                                f"  <span style='font-size:12px;color:#888'>{src} — {ts}</span>", unsafe_allow_html=True)
+                st.markdown(
+                    f"- [{it['title']}]({it['link']})  \n"
+                    f"  <span style='font-size:12px;color:#888'>{it.get('source','')} — {ts}</span>",
+                    unsafe_allow_html=True
+                )
