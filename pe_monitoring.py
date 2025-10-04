@@ -1,475 +1,510 @@
 # pe_monitoring.py
-# Streamlit + Naver OpenAPI + NewsAPI + Telegram + APScheduler
-# - 전체 Top10만 송출
-# - 주말/공휴일 미전송
-# - 도메인(링크 기준) 출처 표기
-# - 중복/유사 제목 자동 제거
-# - Render 환경에서 config.json 고정 로드
-# - 좌측 컨트롤 활성화
-# - Asia/Seoul 타임존 고정 (pytz)
+# Streamlit + APScheduler + NewsAPI + Naver + Telegram
+# - config.json 전부로 키워드/필터 관리
+# - Naver는 키워드별 '개별 조회'로 적중률 개선
+# - 전송은 Top10으로 압축, 출처는 링크 도메인으로 표기
+# - 업무시간/주말/공휴일 미전송 옵션
+# - 미리보기에서 수집→필터→중복→Top10 단계별 진단 출력
 
 import os
 import re
 import json
 import time
 import math
-import html
-import pytz
-import queue
-import string
-import random
+import hashlib
 import logging
+import requests
 import datetime as dt
 from urllib.parse import urlparse
 
-import requests
+import pytz
 import streamlit as st
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# -----------------------------------------------------------------------------
-# 고정 경로(Deploy 환경 기본값)
-# -----------------------------------------------------------------------------
-CONFIG_PATH_DEFAULT = "/opt/render/project/src/config.json"
+# -------------------------
+# 기본 설정
+# -------------------------
+APP_TZ = pytz.timezone("Asia/Seoul")
+CONFIG_PATH = "/opt/render/project/src/config.json"
 
-# -----------------------------------------------------------------------------
-# 공통 유틸
-# -----------------------------------------------------------------------------
-KST = pytz.timezone("Asia/Seoul")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("pe_monitor")
 
-def now_kst() -> dt.datetime:
-    return dt.datetime.now(tz=KST)
-
-def get_domain(url: str) -> str:
+# -------------------------
+# 유틸
+# -------------------------
+def load_config(path: str) -> dict:
     try:
-        d = urlparse(url).netloc.lower()
-        if d.startswith("www."):
-            d = d[4:]
-        return d
-    except Exception:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg
+    except Exception as e:
+        log.exception("config.json 로드 실패: %s", e)
+        return {}
+
+def now_kst():
+    return dt.datetime.now(APP_TZ)
+
+def between_working_hours(kst: dt.datetime, start=8, end=20) -> bool:
+    # end는 포함하지 않음 (20:00 미만)
+    return start <= kst.hour < end
+
+def is_weekend(kst: dt.datetime) -> bool:
+    # 월=0 … 일=6
+    return kst.weekday() >= 5
+
+def is_holiday(kst: dt.datetime, holidays: list[str]) -> bool:
+    ymd = kst.strftime("%Y-%m-%d")
+    return ymd in set(holidays or [])
+
+def domain_of(url: str) -> str:
+    try:
+        d = urlparse(url).netloc
+        return d.replace("www.", "")
+    except:
         return "unknown"
 
-def normalize_title(t: str) -> str:
-    t = re.sub(r"\[[^\]]+\]", " ", t)          # [단독], [속보] 같은 태그 제거
-    t = re.sub(r"\([^)]*\)", " ", t)           # 괄호 부가정보 제거
-    t = re.sub(r"[^\w가-힣\s]", " ", t)         # 특수문자 제거
-    t = re.sub(r"\s+", " ", t).strip().lower()
-    return t
+def sha1(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
-def jaccard(a: str, b: str) -> float:
-    sa = set(a.split())
-    sb = set(b.split())
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
+def clamp(n, lo, hi):
+    return max(lo, min(hi, n))
 
-def human_time(ts: str | dt.datetime):
-    if isinstance(ts, str):
-        return ts
-    if isinstance(ts, dt.datetime):
-        return ts.astimezone(KST).strftime("%Y-%m-%d %H:%M")
-    return str(ts)
-
-# -----------------------------------------------------------------------------
-# 설정 로드
-# -----------------------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def load_config(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def read_env(name: str, default: str = "") -> str:
-    return os.getenv(name, default)
-
-# -----------------------------------------------------------------------------
+# -------------------------
 # 외부 API
-# -----------------------------------------------------------------------------
-def search_naver_news(query: str, display: int = 30, offset: int = 1,
-                      client_id: str = "", client_secret: str = "") -> list[dict]:
-    if not client_id or not client_secret:
+# -------------------------
+def search_newsapi(query: str, page_size: int, api_key: str, from_hours: int = 48):
+    if not api_key or not query:
         return []
-    url = "https://openapi.naver.com/v1/search/news.json"
-    headers = {"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret}
+    base = "https://newsapi.org/v2/everything"
+    from_dt = (now_kst() - dt.timedelta(hours=from_hours)).astimezone(pytz.utc)
     params = {
-        "query": query,
-        "display": max(1, min(display, 100)),
-        "start": max(1, min(offset, 1000)),
-        "sort": "date",
-    }
-    r = requests.get(url, headers=headers, params=params, timeout=10)
-    if r.status_code != 200:
-        return []
-    data = r.json().get("items", [])
-    out = []
-    for it in data:
-        out.append({
-            "title": html.unescape(re.sub(r"<\/?b>", "", it.get("title",""))),
-            "summary": html.unescape(re.sub(r"<\/?b>", "", it.get("description",""))),
-            "link": it.get("link") or it.get("originallink") or "",
-            "published_at": it.get("pubDate"),
-            "source": get_domain(it.get("link") or it.get("originallink") or ""),
-            "via": "naver",
-        })
-    return out
-
-def search_newsapi(query: str, page_size: int = 30, api_key: str = "") -> list[dict]:
-    if not api_key:
-        return []
-    url = "https://newsapi.org/v2/everything"
-    # NewsAPI는 OR 문법이 약해서 | 로 대체, 공백 쿼리는 큰따옴표로 묶어주면 적중률↑
-    def qfix(q: str):
-        parts = [p.strip() for p in q.split(" OR ") if p.strip()]
-        parts = [f"\"{p}\"" if " " in p else p for p in parts]
-        return " OR ".join(parts) if parts else q
-    params = {
-        "q": qfix(query),
-        "pageSize": max(1, min(page_size, 100)),
+        "q": query,
+        "pageSize": clamp(page_size, 10, 100),
         "language": "ko",
         "sortBy": "publishedAt",
+        "from": from_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "apiKey": api_key,
     }
-    r = requests.get(url, params=params, timeout=12)
-    if r.status_code != 200:
+    try:
+        r = requests.get(base, params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        arts = data.get("articles", [])
+        res = []
+        for a in arts:
+            res.append({
+                "title": a.get("title") or "",
+                "url": a.get("url") or "",
+                "source": domain_of(a.get("url") or "") or (a.get("source", {}) or {}).get("name", ""),
+                "publishedAt": a.get("publishedAt"),
+                "summary": a.get("description") or "",
+                "provider": "newsapi",
+            })
+        return res
+    except Exception as e:
+        log.warning("NewsAPI 오류: %s", e)
         return []
-    data = r.json().get("articles", [])
-    out = []
-    for it in data:
-        out.append({
-            "title": it.get("title") or "",
-            "summary": it.get("description") or "",
-            "link": it.get("url") or "",
-            "published_at": it.get("publishedAt"),
-            "source": get_domain(it.get("url") or ""),
-            "via": "newsapi",
-        })
-    return out
 
-# -----------------------------------------------------------------------------
-# 스코어링 & 필터
-# -----------------------------------------------------------------------------
-def score_item(item: dict, cfg: dict) -> float:
-    title = f"{item.get('title','')} {item.get('summary','')}"
-    tnorm = title.lower()
-    score = 0.0
+def search_naver_news(keyword: str, display: int, offset: int, client_id: str, client_secret: str, recency_hours=48):
+    if not client_id or not client_secret or not keyword:
+        return []
+    base = "https://openapi.naver.com/v1/search/news.json"
+    params = {
+        "query": keyword,
+        "display": clamp(display, 1, 30),
+        "start": clamp(offset, 1, 1000),
+        "sort": "date",
+    }
+    headers = {
+        "X-Naver-Client-Id": client_id,
+        "X-Naver-Client-Secret": client_secret,
+    }
+    try:
+        r = requests.get(base, params=params, headers=headers, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("items", [])
+        res = []
+        cutoff = now_kst() - dt.timedelta(hours=recency_hours)
+        for it in items:
+            link = it.get("link") or it.get("originallink") or ""
+            pubdate = it.get("pubDate")
+            # Naver pubDate 예: 'Sat, 05 Oct 2025 09:00:00 +0900'
+            try:
+                pub_kst = dt.datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S %z")
+            except:
+                pub_kst = now_kst()
+            if pub_kst < cutoff:
+                continue
+            title = re.sub("<.*?>", "", it.get("title") or "")
+            desc = re.sub("<.*?>", "", it.get("description") or "")
+            res.append({
+                "title": title,
+                "url": link,
+                "source": domain_of(link),
+                "publishedAt": pub_kst.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "summary": desc,
+                "provider": "naver",
+            })
+        return res
+    except Exception as e:
+        log.warning("Naver 오류(%s): %s", keyword, e)
+        return []
 
-    # 도메인 가중치
-    dw = cfg.get("DOMAIN_WEIGHTS", {})
-    score += float(dw.get(item.get("source",""), 1.0))
-
-    # 키워드 가중치(포함되면 +1)
-    for kw in cfg.get("KEYWORDS", []):
-        if kw.lower() in tnorm:
-            score += 1.0
-
-    # 화제성(대문자/숫자/길이 등 간단 부스트)
-    score += min(1.0, len(item.get("title","")) / 80.0)
-
-    return score
-
+# -------------------------
+# 필터/스코어/중복
+# -------------------------
 def should_drop(item: dict, cfg: dict) -> bool:
-    t = item.get("title","")
-    d = item.get("source","")
-
-    # 제목 제외 키워드
-    for bad in cfg.get("EXCLUDE_TITLE_KEYWORDS", []):
-        if bad and bad.lower() in t.lower():
-            return True
-
-    # 도메인 허용/차단
-    allow = cfg.get("ALLOW_DOMAINS", [])
-    block = cfg.get("BLOCK_DOMAINS", [])
-    if d in block:
+    url = item.get("url", "")
+    title = (item.get("title") or "").strip()
+    if not url or not title:
         return True
-    if cfg.get("ALLOWLIST_STRICT", False) and allow:
-        if d not in allow:
+
+    src = domain_of(url)
+    allow = set(cfg.get("ALLOW_DOMAINS", []) or [])
+    block = set(cfg.get("BLOCK_DOMAINS", []) or [])
+    allow_strict = bool(cfg.get("ALLOWLIST_STRICT"))
+
+    if src in block:
+        return True
+    if allow_strict and allow and (src not in allow):
+        return True
+
+    # 제외 키워드
+    ek = cfg.get("EXCLUDE_TITLE_KEYWORDS", []) or []
+    for w in ek:
+        if w and w.lower() in title.lower():
             return True
 
     return False
 
-def dedup(items: list[dict], threshold: float = 0.55) -> list[dict]:
-    out = []
+def score_item(item: dict, cfg: dict) -> float:
+    # 가중치: 도메인/키워드/신선도
+    src = domain_of(item.get("url", ""))
+    title = item.get("title") or ""
+    score = 0.0
+
+    # 도메인 가중치
+    weights = cfg.get("DOMAIN_WEIGHTS", {}) or {}
+    score += float(weights.get(src, 1.0))
+
+    # 키워드 적중 보너스
+    hit_bonus = 0.0
+    for kw in cfg.get("KEYWORDS", []):
+        if kw and kw.lower() in title.lower():
+            hit_bonus += 1.0
+    for alias in sum([v for v in (cfg.get("KEYWORD_ALIASES") or {}).values()], []):
+        if alias and alias.lower() in title.lower():
+            hit_bonus += 0.5
+    score += hit_bonus
+
+    # 신선도 보정 (최신일수록 가점)
+    try:
+        ts = item.get("publishedAt")
+        pub = dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.utc)
+    except:
+        pub = now_kst()
+    hours_ago = (now_kst() - pub.astimezone(APP_TZ)).total_seconds() / 3600.0
+    rec_boost = max(0.0, 6.0 - (hours_ago / 8.0))  # 0~6 사이
+    score += rec_boost
+
+    return score
+
+def dedup(items: list[dict], threshold: float = 0.82) -> list[dict]:
+    # 간단한 제목 유사도 기반 중복 제거
+    def norm(s: str) -> str:
+        s = re.sub(r"[\[\]\(\)【】『』“”\"'<>]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip().lower()
+        return s
+
     seen = []
+    out = []
     for it in items:
-        nt = normalize_title(it.get("title",""))
-        drop = False
-        for st in seen:
-            if jaccard(nt, st) >= threshold:
-                drop = True
+        t = norm(it.get("title", ""))
+        dup = False
+        for s in seen:
+            # 자카드 유사도
+            a, b = set(t.split()), set(s.split())
+            if not a or not b:
+                continue
+            jac = len(a & b) / max(1, len(a | b))
+            if jac >= threshold:
+                dup = True
                 break
-        if not drop:
+        if not dup:
+            seen.append(t)
             out.append(it)
-            seen.append(nt)
     return out
 
-# -----------------------------------------------------------------------------
-# 텔레그램
-# -----------------------------------------------------------------------------
-def tg_send_message(token: str, chat_id: str, text: str, disable_preview: bool = True) -> bool:
-    if not token or not chat_id:
+def pick_top10(items: list[dict], cfg: dict) -> list[dict]:
+    # 필터
+    filtered = [it for it in items if not should_drop(it, cfg)]
+    # 스코어
+    for it in filtered:
+        it["_score"] = score_item(it, cfg)
+    # 정렬
+    filtered.sort(key=lambda x: x["_score"], reverse=True)
+    # 중복 제거
+    unique = dedup(filtered)
+    # 상위 10개
+    return unique[:10]
+
+# -------------------------
+# Telegram
+# -------------------------
+def send_telegram(bot_token: str, chat_id: str, text: str, disable_web_page_preview: bool = True):
+    if not bot_token or not chat_id:
         return False
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = {
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": disable_preview,
+        "disable_web_page_preview": disable_web_page_preview,
     }
-    r = requests.post(url, data=data, timeout=10)
-    return r.status_code == 200
+    try:
+        r = requests.post(url, json=payload, timeout=12)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        log.warning("텔레그램 전송 실패: %s", e)
+        return False
 
-# -----------------------------------------------------------------------------
-# 전송 로직
-# -----------------------------------------------------------------------------
-def pick_top10(all_items: list[dict], cfg: dict) -> list[dict]:
-    # 1) 제외 필터
-    items = [it for it in all_items if not should_drop(it, cfg)]
-    # 2) 정렬 스코어
-    for it in items:
-        it["_score"] = score_item(it, cfg)
-    items.sort(key=lambda x: x["_score"], reverse=True)
-    # 3) 유사 중복 제거 후 Top10
-    items = dedup(items, threshold=0.55)
-    return items[:10]
-
-def format_telegram_block(header: str, items: list[dict]) -> str:
+def format_telegram_block(title: str, items: list[dict]) -> str:
     if not items:
         return ""
-    lines = [f"📌 <b>{header}</b>"]
+    lines = [f"📌 <b>{title}</b>"]
     for it in items:
-        title = html.escape(it.get("title",""))
-        link  = it.get("link","")
-        dom   = it.get("source","")
-        ts    = it.get("published_at") or ""
-        ts    = human_time(ts)
-        lines.append(f"• {title} ({link}) — {dom} ({ts})")
+        src = domain_of(it.get("url", ""))
+        # 시각: KST로 YYYY-MM-DD HH:MM
+        try:
+            pub = dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.utc).astimezone(APP_TZ)
+            when = pub.strftime("%Y-%m-%d %H:%M")
+        except:
+            when = ""
+        t = it.get("title", "").strip()
+        u = it.get("url", "")
+        lines.append(f"• {t} ({u}) — {src} ({when})")
     return "\n".join(lines)
 
-def transmit_once(cfg: dict, naver_id: str, naver_secret: str, newsapi_key: str,
-                  tg_token: str, tg_chat: str, preview_mode: bool,
-                  page_size: int, recency_hours: int) -> dict:
-    # 주말/공휴일 차단
-    today = now_kst().date()
-    if not preview_mode:
-        if cfg.get("BLOCK_WEEKEND", True) and today.weekday() >= 5:
-            return {"picked": 0, "sent": 0, "skipped": "weekend"}
-        if cfg.get("HOLIDAYS"):  # YYYY-MM-DD 배열
-            holidays = set(dt.date.fromisoformat(h) for h in cfg["HOLIDAYS"])
-            if today in holidays:
-                return {"picked": 0, "sent": 0, "skipped": "holiday"}
+# -------------------------
+# 수집/전송 주기 함수
+# -------------------------
+def transmit_once(cfg: dict, preview_mode: bool, env: dict):
+    keywords = cfg.get("KEYWORDS", []) or []
+    page_size = int(cfg.get("PAGE_SIZE", 30))
+    recency_hours = int(cfg.get("RECENCY_HOURS", 48))
 
-    # 쿼리 생성 (config.json의 KEYWORDS 통합)
-    keywords = cfg.get("KEYWORDS", [])
-    if not keywords:
-        return {"picked": 0, "sent": 0, "skipped": "no_keywords"}
+    newsapi_key = env.get("NEWSAPI_KEY", os.getenv("NEWSAPI_KEY", ""))
+    naver_id = env.get("NAVER_CLIENT_ID", os.getenv("NAVER_CLIENT_ID", ""))
+    naver_secret = env.get("NAVER_CLIENT_SECRET", os.getenv("NAVER_CLIENT_SECRET", ""))
+    bot_token = env.get("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", ""))
+    chat_id = env.get("TELEGRAM_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", ""))
 
-    query = " OR ".join(keywords)
-
-    # 수집
     all_items = []
-    naver = search_naver_news(query, display=page_size, offset=1,
-                              client_id=naver_id, client_secret=naver_secret)
-    all_items += naver
-    newsapi = search_newsapi(query, page_size=page_size, api_key=newsapi_key)
-    all_items += newsapi
 
-    # 시간 필터 (recency_hours)
-    if recency_hours and recency_hours > 0:
-        cutoff = now_kst() - dt.timedelta(hours=recency_hours)
-        def parse_ts(s):
-            try:
-                return dt.datetime.strptime(s, "%a, %d %b %Y %H:%M:%S %z")
-            except Exception:
-                try:
-                    return dt.datetime.fromisoformat(s.replace("Z","+00:00"))
-                except Exception:
-                    return None
-        _tmp = []
-        for it in all_items:
-            ts = parse_ts(it.get("published_at",""))
-            if not ts:
-                _tmp.append(it)  # 시간이 없으면 일단 포함
-            else:
-                if ts >= cutoff:
-                    _tmp.append(it)
-        all_items = _tmp
+    # NAVER — 키워드별 개별 조회(적중률↑)
+    naver_hits = 0
+    for kw in keywords:
+        batch = search_naver_news(
+            kw, display=max(3, page_size // 3), offset=1,
+            client_id=naver_id, client_secret=naver_secret, recency_hours=recency_hours
+        )
+        naver_hits += len(batch)
+        all_items += batch
+        time.sleep(0.2)
 
-    # Top 10 선별
+    # NEWSAPI — OR 조합으로 한 번에
+    newsapi_hits = 0
+    if newsapi_key and keywords:
+        query = " OR ".join(keywords)
+        batch = search_newsapi(query, page_size=page_size, api_key=newsapi_key, from_hours=recency_hours)
+        newsapi_hits = len(batch)
+        all_items += batch
+
+    raw_count = len(all_items)
+
+    # 시간 필터는 각각 검색에서 이미 걸었으므로 카운트만 유지
+    after_time = raw_count
+
+    # 필터/스코어/중복/Top10
+    _stage = [it for it in all_items if not should_drop(it, cfg)]
+    after_filter = len(_stage)
+    for it in _stage:
+        it["_score"] = score_item(it, cfg)
+    _stage.sort(key=lambda x: x["_score"], reverse=True)
+    after_dedup = len(dedup(_stage))
     top10 = pick_top10(all_items, cfg)
 
-    # 전송 or 미리보기
     if preview_mode:
+        return {
+            "picked": len(top10),
+            "sent": 0,
+            "items": top10,
+            "diag": {
+                "naver_hits": naver_hits,
+                "newsapi_hits": newsapi_hits,
+                "raw": raw_count,
+                "after_time": after_time,
+                "after_filter": after_filter,
+                "after_dedup": after_dedup,
+            }
+        }
+
+    # 전송 정책: 업무시간/주말/공휴일
+    kst_now = now_kst()
+    if cfg.get("ONLY_WORKING_HOURS") and not between_working_hours(kst_now, 8, 20):
+        log.info("업무시간 외 — 전송 생략")
+        return {"picked": len(top10), "sent": 0, "items": top10}
+    if cfg.get("BLOCK_WEEKEND") and is_weekend(kst_now):
+        log.info("주말 — 전송 생략")
+        return {"picked": len(top10), "sent": 0, "items": top10}
+    if cfg.get("BLOCK_HOLIDAY") and is_holiday(kst_now, cfg.get("HOLIDAYS", [])):
+        log.info("공휴일 — 전송 생략")
         return {"picked": len(top10), "sent": 0, "items": top10}
 
-    if not tg_token or not tg_chat:
-        return {"picked": len(top10), "sent": 0, "skipped": "no_telegram"}
+    if not top10:
+        log.info("전송할 기사 없음")
+        return {"picked": 0, "sent": 0, "items": []}
 
-    block = format_telegram_block("Top 10 뉴스", top10)
-    if not block:
-        return {"picked": 0, "sent": 0, "skipped": "empty"}
+    text = format_telegram_block("Top 10", top10)
+    ok = send_telegram(
+        bot_token, chat_id, text,
+        disable_web_page_preview=bool(cfg.get("TELEGRAM_DISABLE_PREVIEW", True))
+    )
+    return {"picked": len(top10), "sent": (1 if ok else 0), "items": top10}
 
-    ok = tg_send_message(tg_token, tg_chat, block, disable_preview=cfg.get("TELEGRAM_DISABLE_PREVIEW", True))
-    return {"picked": len(top10), "sent": 1 if ok else 0, "items": top10}
-
-# -----------------------------------------------------------------------------
-# 스케줄러
-# -----------------------------------------------------------------------------
-SCHED = BackgroundScheduler(timezone="Asia/Seoul")
-JOB_ID = "pe_monitoring_job"
-
-def start_scheduler(cfg, naver_id, naver_secret, newsapi_key, tg_token, tg_chat,
-                    page_size, recency_hours, interval_min):
-    def job():
-        transmit_once(cfg, naver_id, naver_secret, newsapi_key, tg_token, tg_chat,
-                      preview_mode=False, page_size=page_size, recency_hours=recency_hours)
-
-    if SCHED.get_job(JOB_ID):
-        SCHED.remove_job(JOB_ID)
-    SCHED.add_job(job, "interval", minutes=max(5, int(interval_min)), id=JOB_ID, next_run_time=now_kst())
-    if not SCHED.running:
-        SCHED.start()
-
-def stop_scheduler():
-    if SCHED.get_job(JOB_ID):
-        SCHED.remove_job(JOB_ID)
-
-# -----------------------------------------------------------------------------
-# UI
-# -----------------------------------------------------------------------------
+# -------------------------
+# Streamlit UI
+# -------------------------
 st.set_page_config(page_title="PE 동향 뉴스 → Telegram 자동 전송", page_icon="📰", layout="wide")
 
-st.markdown("### 📰 PE 동향 뉴스 → Telegram 자동 전송")
-st.caption("Streamlit + Naver + NewsAPI + Telegram + APScheduler")
+cfg = load_config(CONFIG_PATH)
+st.sidebar.header("자격증명 / 설정")
+st.sidebar.caption(f"CONFIG 경로:\n{CONFIG_PATH}\n/ 존재: {'True' if cfg else 'False'}")
 
-# 좌측: 자격/설정
-st.sidebar.markdown("**자격증명 / 설정**")
-cfg_path = CONFIG_PATH_DEFAULT
-cfg_exists = os.path.exists(cfg_path)
-st.sidebar.caption(f"CONFIG 경로:\n`{cfg_path}` / 존재: **{'True' if cfg_exists else 'False'}**")
+# 비밀키 입력 (선택적으로 UI에서 오버라이드)
+newsapi_key = st.sidebar.text_input("NewsAPI Key (선택)", type="password", value=os.getenv("NEWSAPI_KEY", ""))
+naver_id = st.sidebar.text_input("Naver Client ID (선택)", type="password", value=os.getenv("NAVER_CLIENT_ID", ""))
+naver_secret = st.sidebar.text_input("Naver Client Secret (선택)", type="password", value=os.getenv("NAVER_CLIENT_SECRET", ""))
+bot_token = st.sidebar.text_input("Telegram Bot Token", type="password", value=os.getenv("TELEGRAM_BOT_TOKEN", ""))
+chat_id = st.sidebar.text_input("Telegram Chat ID (맨디/그룹)", value=os.getenv("TELEGRAM_CHAT_ID", ""))
 
-newsapi_key = st.sidebar.text_input("NewsAPI Key (선택)", value=read_env("NEWSAPI_KEY"), type="password")
-naver_id    = st.sidebar.text_input("Naver Client ID (선택)", value=read_env("NAVER_CLIENT_ID"), type="password")
-naver_secret= st.sidebar.text_input("Naver Client Secret (선택)", value=read_env("NAVER_CLIENT_SECRET"), type="password")
-tg_token    = st.sidebar.text_input("Telegram Bot Token", value=read_env("TELEGRAM_BOT_TOKEN"), type="password")
-tg_chat     = st.sidebar.text_input("Telegram Chat ID", value=read_env("TELEGRAM_CHAT_ID") or "", help="예: -100xxxxxxxxxx")
-
-st.sidebar.markdown("---")
+st.sidebar.divider()
 st.sidebar.subheader("config.json")
-
 if st.sidebar.button("구성 리로드", use_container_width=True):
-    st.cache_resource.clear()
+    cfg = load_config(CONFIG_PATH)
+    st.rerun()
 
-cfg = load_config(cfg_path) if cfg_exists else {
-    "KEYWORDS": [],
-    "ALLOW_DOMAINS": [],
-    "BLOCK_DOMAINS": [],
-    "EXCLUDE_TITLE_KEYWORDS": [],
-    "DOMAIN_WEIGHTS": {},
-    "TELEGRAM_DISABLE_PREVIEW": True,
-    "ALLOWLIST_STRICT": False,
-    "BLOCK_WEEKEND": True,
-    "HOLIDAYS": [],   # ["2025-10-03", ...]
-}
+# 읽기 전용 키워드 표시
+kw_readonly = ", ".join(cfg.get("KEYWORDS", []))
+st.sidebar.caption("KEYWORDS (읽기전용)")
+st.sidebar.code(kw_readonly or "(none)", language="text")
 
-# 읽기 전용 표시
-kw_preview = ", ".join(cfg.get("KEYWORDS", [])) or "(none)"
-st.sidebar.caption(f"**KEYWORDS (읽기전용)**\n{kw_preview}")
+# 파라미터 (표시만, 값은 config.json 기준)
+page_size = st.sidebar.number_input("페이지당 수집 수", min_value=10, max_value=100, step=1, value=int(cfg.get("PAGE_SIZE", 30)))
+max_per_kw = st.sidebar.number_input("전송 건수 제한(키워드별)", min_value=3, max_value=20, step=1, value=int(cfg.get("MAX_PER_KEYWORD", 10)))
+interval_min = st.sidebar.number_input("전송 주기(분)", min_value=15, max_value=360, step=5, value=int(cfg.get("INTERVAL_MIN", 60)))
+recency_hours = st.sidebar.number_input("신선도(최근 N시간)", min_value=6, max_value=168, step=6, value=int(cfg.get("RECENCY_HOURS", 48)))
 
-# 조정 가능한 파라미터 (disabled=False)
-page_size      = st.sidebar.number_input("페이지당 수집 수", min_value=5, max_value=100, value=int(cfg.get("PAGE_SIZE", 30)), step=1, disabled=False)
-max_per_kw     = st.sidebar.number_input("전송 건수 제한(키워드별)", min_value=1, max_value=50, value=int(cfg.get("MAX_PER_KEYWORD", 10)), step=1, disabled=False)
-interval_min   = st.sidebar.number_input("전송 주기(분)", min_value=5, max_value=720, value=int(cfg.get("INTERVAL_MINUTES", 60)), step=5, disabled=False)
-recency_hours  = st.sidebar.number_input("신선도(최근 N시간)", min_value=1, max_value=168, value=int(cfg.get("RECENCY_HOURS", 48)), step=1, disabled=False)
+st.sidebar.checkbox("✅ 업무시간(08~20 KST) 내 전송", value=bool(cfg.get("ONLY_WORKING_HOURS", True)), disabled=True)
+st.sidebar.checkbox("🔗 링크 프리뷰 비활성화", value=bool(cfg.get("TELEGRAM_DISABLE_PREVIEW", True)), disabled=True)
+st.sidebar.checkbox("🚫 주말 미전송", value=bool(cfg.get("BLOCK_WEEKEND", True)), disabled=True)
+st.sidebar.checkbox("🚫 공휴일 미전송", value=bool(cfg.get("BLOCK_HOLIDAY", False)), disabled=True)
+st.sidebar.checkbox("🧱 ALLOWLIST_STRICT (허용 도메인 외 차단)", value=bool(cfg.get("ALLOWLIST_STRICT", False)), disabled=True)
 
-st.sidebar.markdown("---")
-workhour_only  = st.sidebar.checkbox("업무시간(08~20 KST) 내 전송", value=bool(cfg.get("ONLY_WORKING_HOURS", True)))
-disable_prev   = st.sidebar.checkbox("링크 프리뷰 비활성화", value=bool(cfg.get("TELEGRAM_DISABLE_PREVIEW", True)))
-block_weekend  = st.sidebar.checkbox("주말 미전송", value=bool(cfg.get("BLOCK_WEEKEND", True)))
-block_holiday  = st.sidebar.checkbox("공휴일 미전송", value=True)
-allowlist_strict = st.sidebar.checkbox("ALLOWLIST_STRICT (허용 도메인만)", value=bool(cfg.get("ALLOWLIST_STRICT", False)))
+st.title("📰 PE 동향 뉴스 ➜ Telegram 자동 전송")
+st.caption("Streamlit + NewsAPI/Naver + Telegram + APScheduler")
 
-# UI 상태 표시
-st.markdown("#### 상태")
-running = bool(SCHED.get_job(JOB_ID))
-st.info(f"Scheduler 실행 중: {running}")
+col1, col2, col3, col4 = st.columns([1,1,1,1])
+with col1:
+    if st.button("지금 한번 실행(미리보기)", type="primary"):
+        res = transmit_once(cfg, preview_mode=True, env={
+            "NEWSAPI_KEY": newsapi_key,
+            "NAVER_CLIENT_ID": naver_id,
+            "NAVER_CLIENT_SECRET": naver_secret,
+            "TELEGRAM_BOT_TOKEN": bot_token,
+            "TELEGRAM_CHAT_ID": chat_id,
+        })
+        st.session_state["preview"] = res
 
-# 버튼들
-colA, colB, colC, colD = st.columns(4)
-with colA:
-    if st.button("지금 한 번 실행(미리보기)", use_container_width=True):
-        # 미리보기
-        cfg["ALLOWLIST_STRICT"] = allowlist_strict
-        cfg["TELEGRAM_DISABLE_PREVIEW"] = disable_prev
-        cfg["BLOCK_WEEKEND"] = block_weekend
-        if not block_holiday:
-            cfg["HOLIDAYS"] = []  # 미적용
-        res = transmit_once(cfg, naver_id, naver_secret, newsapi_key, tg_token, tg_chat,
-                            preview_mode=True, page_size=page_size, recency_hours=recency_hours)
-        st.session_state["preview_items"] = res.get("items", [])
-        st.success(f"완료: {len(res.get('items', []))}건 미리보기, 0건 전송(미리보기 모드)")
-with colB:
-    if st.button("지금 한 번 전송", use_container_width=True):
-        cfg["ALLOWLIST_STRICT"] = allowlist_strict
-        cfg["TELEGRAM_DISABLE_PREVIEW"] = disable_prev
-        cfg["BLOCK_WEEKEND"] = block_weekend
-        if not block_holiday:
-            cfg["HOLIDAYS"] = []
-        res = transmit_once(cfg, naver_id, naver_secret, newsapi_key, tg_token, tg_chat,
-                            preview_mode=False, page_size=page_size, recency_hours=recency_hours)
-        st.success(f"전송 완료: 선별 {res.get('picked',0)}건 / 전송 {res.get('sent',0)}건")
-with colC:
-    if st.button("스케줄 시작", use_container_width=True):
-        # 업무시간 가드: 스케줄러 작업에서 체크
-        cfg["ONLY_WORKING_HOURS"] = workhour_only
-        cfg["ALLOWLIST_STRICT"] = allowlist_strict
-        cfg["TELEGRAM_DISABLE_PREVIEW"] = disable_prev
-        cfg["BLOCK_WEEKEND"] = block_weekend
-        if not block_holiday:
-            cfg["HOLIDAYS"] = []
-        start_scheduler(cfg, naver_id, naver_secret, newsapi_key, tg_token, tg_chat,
-                        page_size, recency_hours, interval_min)
-        st.success("스케줄러 시작")
-with colD:
-    if st.button("스케줄 정지", use_container_width=True):
-        stop_scheduler()
-        st.warning("스케줄러 정지")
+with col2:
+    if st.button("지금 한번 전송"):
+        res = transmit_once(cfg, preview_mode=False, env={
+            "NEWSAPI_KEY": newsapi_key,
+            "NAVER_CLIENT_ID": naver_id,
+            "NAVER_CLIENT_SECRET": naver_secret,
+            "TELEGRAM_BOT_TOKEN": bot_token,
+            "TELEGRAM_CHAT_ID": chat_id,
+        })
+        st.session_state["preview"] = res
 
-st.markdown("---")
+SCHED = BackgroundScheduler(timezone=APP_TZ)
+if "sched_started" not in st.session_state:
+    st.session_state["sched_started"] = False
 
-# 미리보기 섹션
-st.markdown("### 미리보기: 최신 10건")
-items = st.session_state.get("preview_items", [])
+def scheduled_job():
+    try:
+        transmit_once(cfg, preview_mode=False, env={
+            "NEWSAPI_KEY": os.getenv("NEWSAPI_KEY", ""),
+            "NAVER_CLIENT_ID": os.getenv("NAVER_CLIENT_ID", ""),
+            "NAVER_CLIENT_SECRET": os.getenv("NAVER_CLIENT_SECRET", ""),
+            "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+            "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", ""),
+        })
+    except Exception as e:
+        log.exception("스케줄 작업 실패: %s", e)
 
-# 업무시간/주말/공휴일 안내
-tips = []
-if workhour_only:
-    tips.append("업무시간(08~20 KST) 내 전송")
-if block_weekend:
-    tips.append("주말 미전송")
-if block_holiday:
-    tips.append("공휴일 미전송")
-if tips:
-    st.caption(" · ".join(tips))
+with col3:
+    if not st.session_state["sched_started"]:
+        if st.button("스케줄 시작"):
+            # interval_min은 config.json 기준으로 적용
+            minutes = int(cfg.get("INTERVAL_MIN", 60))
+            SCHED.add_job(scheduled_job, "interval", minutes=minutes, id="job1", replace_existing=True, next_run_time=now_kst()+dt.timedelta(seconds=3))
+            SCHED.start()
+            st.session_state["sched_started"] = True
+    else:
+        st.button("스케줄 시작", disabled=True)
 
-if not items:
-    with st.expander("Top 10 — 0건", expanded=True):
+with col4:
+    if st.button("스케줄 중지"):
+        try:
+            SCHED.shutdown(wait=False)
+        except:
+            pass
+        st.session_state["sched_started"] = False
+
+st.subheader("상태")
+st.info(f"Scheduler 실행 중: {st.session_state['sched_started']}")
+
+# 미리보기 출력
+st.subheader("미리보기: 최신 10건")
+res = st.session_state.get("preview", {})
+items = res.get("items", [])
+diag = res.get("diag", {})
+
+with st.expander(f"Top 10 — {len(items)}건", expanded=True):
+    if not items:
         st.write("결과 없음")
-else:
-    with st.expander(f"Top 10 — {len(items)}건", expanded=True):
+    else:
         for it in items:
-            dom = it.get("source","")
-            ts  = human_time(it.get("published_at",""))
-            st.markdown(f"- **{it.get('title','')}**  \n  {it.get('summary','')}  \n  [{dom}]({it.get('link','')}) · {ts}")
+            src = domain_of(it.get("url", ""))
+            title = it.get("title", "")
+            url = it.get("url", "")
+            try:
+                pub = dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.utc).astimezone(APP_TZ)
+                when = pub.strftime("%Y-%m-%d %H:%M")
+            except:
+                when = "-"
+            st.markdown(f"- **{title}**  \n  {url}  — *{src}* ({when})")
 
-# -----------------------------------------------------------------------------
-# 스케줄러 실행 중일 때: 업무시간/공휴일 차단 로직(잡 함수 내부에서 재확인)
-# -----------------------------------------------------------------------------
-def scheduler_guard():
-    job = SCHED.get_job(JOB_ID)
-    if not job:
-        return
-    # 업무시간 체크
-    if cfg.get("ONLY_WORKING_HOURS", True):
-        hn = now_kst().hour
-        if not (8 <= hn <= 20):
-            return  # off-hours, 실제 전송은 job 내부에서 한번 더 가드함
+if diag:
+    st.caption(
+        f"수집(Naver/NewsAPI): {diag.get('naver_hits',0)}/{diag.get('newsapi_hits',0)} • "
+        f"원시합계: {diag.get('raw',0)} → 시간필터: {diag.get('after_time',0)} → "
+        f"제외필터: {diag.get('after_filter',0)} → 중복제거후: {diag.get('after_dedup',0)} → Top10: {len(items)}"
+    )
 
-scheduler_guard()
+st.write("")
+st.caption("※ 키워드는 모두 config.json에서 관리합니다. (앱 재시작 없이 '구성 리로드'로 반영)")
