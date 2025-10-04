@@ -25,7 +25,7 @@ log = logging.getLogger("pe_monitor")
 
 # 스케줄러 잡이 참조할 "현재" 구성/환경 (start_schedule()에서 갱신)
 CURRENT_CFG_PATH = DEFAULT_CONFIG_PATH
-CURRENT_CFG_DICT: Dict = {}     # ← UI에서 시작할 때 스냅샷 저장 (재시작 전까지 유효)
+CURRENT_CFG_DICT: Dict = {}     # UI에서 시작할 때 스냅샷 저장 (재시작 전까지 유효)
 CURRENT_ENV = {
     "NEWSAPI_KEY": os.getenv("NEWSAPI_KEY", ""),
     "NAVER_CLIENT_ID": os.getenv("NAVER_CLIENT_ID", ""),
@@ -139,7 +139,7 @@ def search_naver_news(keyword: str, client_id: str, client_secret: str, recency_
         log.warning("Naver 오류(%s): %s", keyword, e)
         return []
 
-def search_newsapi(query: str, page_size: int, api_key: str, from_hours: int = 72, cfg: dict | None = None) -> List[dict]:
+def search_newsapi(query: str, page_size: int, api_key: str, from_hours: int = 72, cfg: dict = None) -> List[dict]:
     if not api_key or not query:
         return []
     base = "https://newsapi.org/v2/everything"
@@ -180,7 +180,109 @@ def search_newsapi(query: str, page_size: int, api_key: str, from_hours: int = 7
         return []
 
 # -------------------------
-# 필터/정렬/중복제거
+# 중복 제거 강화 (URL/제목 정규화 + 근사 중복)
+# -------------------------
+NAVER_ART_RE = re.compile(r"/article/(\d{3})/(\d{10})")
+NOISE_TAGS = {"단독","속보","시그널","fn마켓워치","투자360","영상","포토","르포","사설","칼럼","분석"}
+BRACKET_RE   = re.compile(r"[\[\(（](.*?)[\]\)）]")
+MULTISPACE_RE = re.compile(r"\s+")
+SYNONYM_MAP = {
+    "imm인베스트먼트": "imm인베",
+    "imm 인베스트먼트": "imm인베",
+    "imm investment": "imm인베",
+    "mergers & acquisitions": "m&a",
+    "인베스트먼트": "인베",
+}
+
+def canonical_url_id(url: str) -> str:
+    """같은 기사를 동일 키로 묶기 위한 정규화 ID 생성."""
+    try:
+        u = urlparse(url)
+        host = (u.netloc or "").replace("www.", "")
+        path = u.path or ""
+        if host.endswith("naver.com"):
+            m = NAVER_ART_RE.search(path)
+            if m:
+                oid, aid = m.group(1), m.group(2)
+                return f"naver:{oid}:{aid}"
+        base = f"{host}{path}".rstrip("/")
+        return re.sub(r"/+$", "", base)
+    except Exception:
+        return url
+
+def normalize_title(t: str) -> str:
+    if not t:
+        return ""
+    s = t
+    # 괄호/대괄호 안의 태그성 토큰 제거
+    def _strip_noise(m):
+        inner = (m.group(1) or "").strip()
+        return "" if any(tag in inner.replace(" ", "") for tag in NOISE_TAGS) else inner
+    s = BRACKET_RE.sub(_strip_noise, s)
+    # 머리말 태그 제거
+    for tag in NOISE_TAGS:
+        s = re.sub(rf"^\s*(?:\[{tag}\]|\({tag}\))\s*", "", s, flags=re.IGNORECASE)
+    # 특수문자/말줄임표 정리
+    s = s.replace("…", " ").replace("ㆍ", " ").replace("·", " ").replace("—", " ")
+    # 동의어 통일 (소문자)
+    s_low = s.lower()
+    for k, v in SYNONYM_MAP.items():
+        s_low = s_low.replace(k, v)
+    # 숫자 콤마 정규화
+    s_low = re.sub(r"\b(\d{1,3}(,\d{3})+|\d+)\b", lambda m: m.group(0).replace(",", ""), s_low)
+    # 공백 정리
+    s_low = MULTISPACE_RE.sub(" ", s_low).strip()
+    return s_low
+
+def _tokens(s: str) -> set:
+    return {w for w in re.split(r"[^0-9a-zA-Z가-힣]+", s) if len(w) >= 2}
+
+def _bigrams(s: str) -> set:
+    return {s[i:i+2] for i in range(len(s)-1)} if len(s) > 1 else set()
+
+def is_near_dup(a: str, b: str) -> bool:
+    """정규화 제목 a,b 근접 중복 판단."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    ta, tb = _tokens(a), _tokens(b)
+    if ta and tb:
+        j_tok = len(ta & tb) / max(1, len(ta | tb))
+        if j_tok >= 0.70:
+            return True
+    ba, bb = _bigrams(a), _bigrams(b)
+    if ba and bb:
+        j_bg = len(ba & bb) / max(1, len(ba | bb))
+        if j_bg >= 0.55:
+            return True
+    if a in b or b in a:
+        return True
+    return False
+
+def dedup(items: List[dict]) -> List[dict]:
+    """URL 정규화 → 제목 근사 중복 제거 2단계."""
+    out, seen_by_id, seen_titles = [], set(), []
+    for it in items:
+        url = it.get("url", "")
+        cid = canonical_url_id(url)
+        if cid in seen_by_id:
+            continue
+        norm_t = normalize_title(it.get("title", ""))
+        dup = False
+        for prev_norm, _idx in seen_titles:
+            if is_near_dup(norm_t, prev_norm):
+                dup = True
+                break
+        if dup:
+            continue
+        seen_by_id.add(cid)
+        seen_titles.append((norm_t, len(out)))
+        out.append(it)
+    return out
+
+# -------------------------
+# 필터/정렬
 # -------------------------
 def should_drop(item: dict, cfg: dict) -> bool:
     url = item.get("url", "")
@@ -206,7 +308,7 @@ def should_drop(item: dict, cfg: dict) -> bool:
             if sid not in sids:
                 return True
 
-    # 제목 포함 키워드 / 제외 키워드
+    # 제목 포함/제외 키워드
     include = (cfg.get("INCLUDE_TITLE_KEYWORDS", []) or [])
     if include and not any(w.lower() in title.lower() for w in include):
         return True
@@ -215,30 +317,6 @@ def should_drop(item: dict, cfg: dict) -> bool:
             return True
 
     return False
-
-def dedup(items: List[dict], threshold: float = 0.82) -> List[dict]:
-    def norm(s: str) -> str:
-        s = re.sub(r'[\[\]\(\)【】“”"\'<>]', " ", s or "")
-        s = re.sub(r"\s+", " ", s).strip().lower()
-        return s
-
-    seen = []
-    out = []
-    for it in items:
-        t = norm(it.get("title", ""))
-        dup = False
-        for s in seen:
-            a, b = set(t.split()), set(s.split())
-            if not a or not b:
-                continue
-            jac = len(a & b) / max(1, len(a | b))
-            if jac >= threshold:
-                dup = True
-                break
-        if not dup:
-            seen.append(t)
-            out.append(it)
-    return out
 
 def score_item(item: dict, cfg: dict) -> float:
     # 간단 가중치: 도메인 가중치 + 신선도
@@ -296,7 +374,8 @@ def format_telegram_text(items: List[dict]) -> str:
             when = pub.strftime("%Y-%m-%d %H:%M")
         except Exception:
             when = "-"
-        lines.append(f"• <a href=\"{u}\">{t}</a> ({when})")  # 제목=링크, 출처 도메인 미표시
+        # 제목=링크, 출처 도메인 미표시
+        lines.append(f"• <a href=\"{u}\">{t}</a> ({when})")
     return "\n".join(lines)
 
 def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
@@ -347,10 +426,10 @@ def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
 
     # 신규 없으면 알림
     if not new_items:
-        ok = send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), "📭 신규 뉴스 없음")
+        send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), "📭 신규 뉴스 없음")
         return {"count": 0, "items": []}
 
-    # 텔레그램 4096자 제한 대비 — 30개 단위로 배치 전송(필요시)
+    # 텔레그램 4096자 제한 대비 — 30개 단위로 배치 전송
     BATCH = 30
     sent_any = False
     for i in range(0, len(new_items), BATCH):
@@ -402,7 +481,7 @@ def is_running(sched: BackgroundScheduler) -> bool:
 def start_schedule(cfg_path: str, cfg_dict: dict, env: dict, minutes: int):
     global CURRENT_CFG_PATH, CURRENT_CFG_DICT, CURRENT_ENV
     CURRENT_CFG_PATH = cfg_path
-    CURRENT_CFG_DICT = dict(cfg_dict)  # ← UI에서 조정한 옵션까지 스냅샷 저장
+    CURRENT_CFG_DICT = dict(cfg_dict)  # UI 조정 옵션까지 스냅샷 저장
     CURRENT_ENV = env
     sched = get_scheduler()
     ensure_interval_job(sched, minutes)
