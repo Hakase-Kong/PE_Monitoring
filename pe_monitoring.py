@@ -25,6 +25,7 @@ log = logging.getLogger("pe_monitor")
 
 # 스케줄러 잡이 참조할 "현재" 구성/환경 (start_schedule()에서 갱신)
 CURRENT_CFG_PATH = DEFAULT_CONFIG_PATH
+CURRENT_CFG_DICT: Dict = {}     # ← UI에서 시작할 때 스냅샷 저장 (재시작 전까지 유효)
 CURRENT_ENV = {
     "NEWSAPI_KEY": os.getenv("NEWSAPI_KEY", ""),
     "NAVER_CLIENT_ID": os.getenv("NAVER_CLIENT_ID", ""),
@@ -65,6 +66,16 @@ def _naver_sid(url: str) -> Optional[str]:
 
 def sha1(text: str) -> str:
     return hashlib.sha1((text or "").encode("utf-8")).hexdigest()
+
+def is_weekend(kst: dt.datetime) -> bool:
+    return kst.weekday() >= 5
+
+def is_holiday(kst: dt.datetime, holidays: List[str]) -> bool:
+    ymd = kst.strftime("%Y-%m-%d")
+    return ymd in set(holidays or [])
+
+def between_working_hours(kst: dt.datetime, start=8, end=20) -> bool:
+    return start <= kst.hour < end
 
 # -------------------------
 # 전송 캐시 (중복 방지)
@@ -285,8 +296,7 @@ def format_telegram_text(items: List[dict]) -> str:
             when = pub.strftime("%Y-%m-%d %H:%M")
         except Exception:
             when = "-"
-        # 제목을 하이퍼링크로, 출처 도메인 표시는 제거
-        lines.append(f"• <a href=\"{u}\">{t}</a> ({when})")
+        lines.append(f"• <a href=\"{u}\">{t}</a> ({when})")  # 제목=링크, 출처 도메인 미표시
     return "\n".join(lines)
 
 def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
@@ -307,6 +317,17 @@ def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
         log.warning("텔레그램 전송 실패: %s", e)
         return False
 
+def _should_skip_by_time(cfg: dict) -> bool:
+    """업무시간/주말/공휴일 옵션에 따라 전송을 건너뛸지 판단"""
+    kst_now = now_kst()
+    if cfg.get("ONLY_WORKING_HOURS") and not between_working_hours(kst_now, 8, 20):
+        return True
+    if cfg.get("BLOCK_WEEKEND") and is_weekend(kst_now):
+        return True
+    if cfg.get("BLOCK_HOLIDAY") and is_holiday(kst_now, cfg.get("HOLIDAYS", [])):
+        return True
+    return False
+
 def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
     # 전체 수집 → 필터/정렬 → 전체 리스트
     all_items = collect_all(cfg, env)
@@ -314,6 +335,11 @@ def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
 
     if preview:
         return {"count": len(ranked), "items": ranked}
+
+    # 전송 타임 필터
+    if _should_skip_by_time(cfg):
+        log.info("시간 정책에 의해 전송 건너뜀 (업무시간/주말/공휴일)")
+        return {"count": 0, "items": []}
 
     # 신규만 전송 (캐시 기준)
     cache = load_sent_cache()
@@ -332,7 +358,6 @@ def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
         text = format_telegram_text(chunk)
         ok = send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), text)
         sent_any = sent_any or ok
-        # 너무 빠른 연속 전송 방지
         time.sleep(0.6)
 
     if sent_any:
@@ -351,7 +376,8 @@ def get_scheduler() -> BackgroundScheduler:
     return sched
 
 def scheduled_job():
-    cfg = load_config(CURRENT_CFG_PATH)
+    # UI에서 스냅샷이 있으면 그것을 우선 사용
+    cfg = CURRENT_CFG_DICT or load_config(CURRENT_CFG_PATH)
     try:
         transmit_once(cfg, CURRENT_ENV, preview=False)
     except Exception as e:
@@ -372,15 +398,23 @@ def is_running(sched: BackgroundScheduler) -> bool:
     except Exception:
         return False
 
-# 스케줄 시작(버튼 핸들러용) — 여기서만 global 사용
-def start_schedule(cfg_path: str, env: dict, minutes: int):
-    global CURRENT_CFG_PATH, CURRENT_ENV
+# 스케줄 시작/중지(버튼 핸들러용) — 여기서만 global 사용
+def start_schedule(cfg_path: str, cfg_dict: dict, env: dict, minutes: int):
+    global CURRENT_CFG_PATH, CURRENT_CFG_DICT, CURRENT_ENV
     CURRENT_CFG_PATH = cfg_path
+    CURRENT_CFG_DICT = dict(cfg_dict)  # ← UI에서 조정한 옵션까지 스냅샷 저장
     CURRENT_ENV = env
     sched = get_scheduler()
     ensure_interval_job(sched, minutes)
     # 즉시 1회 수행
     scheduled_job()
+
+def stop_schedule():
+    sched = get_scheduler()
+    try:
+        sched.remove_job("pe_news_job")
+    except Exception:
+        pass
 
 # -------------------------
 # Streamlit UI
@@ -389,8 +423,11 @@ st.set_page_config(page_title="PE 동향 뉴스 모니터링", page_icon="📰",
 
 # Config / 자격증명
 cfg_path = st.sidebar.text_input("config.json 경로", value=DEFAULT_CONFIG_PATH)
-cfg = load_config(cfg_path)
-st.sidebar.caption(f"Config 로드 상태: {'✅' if cfg else '❌'}  · 경로: {cfg_path}")
+cfg_file = load_config(cfg_path)
+st.sidebar.caption(f"Config 로드 상태: {'✅' if cfg_file else '❌'}  · 경로: {cfg_path}")
+
+# 파일의 기본값을 UI 런타임 cfg로 복사
+cfg = dict(cfg_file)
 
 naver_id = st.sidebar.text_input("Naver Client ID", type="password", value=os.getenv("NAVER_CLIENT_ID", ""))
 naver_secret = st.sidebar.text_input("Naver Client Secret", type="password", value=os.getenv("NAVER_CLIENT_SECRET", ""))
@@ -402,10 +439,19 @@ chat_id = st.sidebar.text_input("Telegram Chat ID (채널/그룹)", value=os.get
 st.sidebar.divider()
 st.sidebar.subheader("전송/수집 파라미터")
 cfg["PAGE_SIZE"] = int(st.sidebar.number_input("페이지당 수집 수", min_value=10, max_value=100, step=1, value=int(cfg.get("PAGE_SIZE", 30))))
-cfg["INTERVAL_MIN"] = int(st.sidebar.number_input("전송 주기(분)", min_value=5, max_value=360, step=5, value=int(cfg.get("INTERVAL_MIN", 60))))
+cfg["INTERVAL_MIN"] = int(st.sidebar.number_input("전송 주기(분)", min_value=5, max_value=360, step=5, value=int(cfg.get("INTERVAL_MIN", cfg.get("TRANSMIT_INTERVAL_MIN", 60)))))
 cfg["RECENCY_HOURS"] = int(st.sidebar.number_input("신선도(최근 N시간)", min_value=6, max_value=168, step=6, value=int(cfg.get("RECENCY_HOURS", 72))))
 
-# 필터 토글
+# ✅ 시간 정책 토글
+st.sidebar.subheader("시간 정책")
+cfg["ONLY_WORKING_HOURS"] = bool(st.sidebar.checkbox("✅ 업무시간(08~20 KST) 내 전송", value=bool(cfg.get("ONLY_WORKING_HOURS", True))))
+cfg["BLOCK_WEEKEND"]     = bool(st.sidebar.checkbox("🚫 주말 미전송", value=bool(cfg.get("BLOCK_WEEKEND", True))))
+cfg["BLOCK_HOLIDAY"]     = bool(st.sidebar.checkbox("🚫 공휴일 미전송", value=bool(cfg.get("BLOCK_HOLIDAY", False))))
+holidays_text = st.sidebar.text_area("공휴일(YYYY-MM-DD, 쉼표 또는 줄바꿈 구분)", value=", ".join(cfg.get("HOLIDAYS", [])))
+cfg["HOLIDAYS"] = [s.strip() for s in re.split(r"[,\n]", holidays_text) if s.strip()]
+
+# 기타 필터 토글
+st.sidebar.subheader("기타 필터")
 cfg["ALLOWLIST_STRICT"] = bool(st.sidebar.checkbox("🧱 ALLOWLIST_STRICT (허용 도메인 외 차단)", value=bool(cfg.get("ALLOWLIST_STRICT", True))))
 
 st.sidebar.divider()
@@ -424,7 +470,7 @@ def make_env() -> dict:
         "TELEGRAM_CHAT_ID": chat_id,
     }
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 sched = get_scheduler()
 
 with col1:
@@ -439,8 +485,13 @@ with col2:
 
 with col3:
     if st.button("스케줄 시작"):
-        start_schedule(cfg_path=cfg_path, env=make_env(), minutes=int(cfg["INTERVAL_MIN"]))
+        start_schedule(cfg_path=cfg_path, cfg_dict=cfg, env=make_env(), minutes=int(cfg["INTERVAL_MIN"]))
         st.success("스케줄 시작됨 (즉시 전송 후 주기 실행)")
+
+with col4:
+    if st.button("스케줄 중지"):
+        stop_schedule()
+        st.warning("스케줄 중지됨")
 
 # 상태
 _running = is_running(sched)
