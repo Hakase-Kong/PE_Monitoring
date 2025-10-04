@@ -17,7 +17,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # 기본 설정
 # -------------------------
 APP_TZ = pytz.timezone("Asia/Seoul")
-DEFAULT_CONFIG_PATH = "config_pe_expanded.json"  # 동일 디렉토리 기준
+DEFAULT_CONFIG_PATH = "config.json"  # 동일 디렉토리 기준
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pe_monitor_fixed")
