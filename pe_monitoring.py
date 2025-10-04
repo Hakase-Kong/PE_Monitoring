@@ -13,18 +13,13 @@ import pytz
 import streamlit as st
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# -------------------------
-# 기본 설정
-# -------------------------
 APP_TZ = pytz.timezone("Asia/Seoul")
-DEFAULT_CONFIG_PATH = "config.json"  # 동일 디렉토리 기준
+DEFAULT_CONFIG_PATH = "config.json"
+CACHE_FILE = "sent_cache.json"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pe_monitor_fixed")
 
-# -------------------------
-# 유틸
-# -------------------------
 def load_config(path: str) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -34,7 +29,10 @@ def load_config(path: str) -> dict:
         return {}
 
 def now_kst():
-    return dt.datetime.now(APP_TZ)
+    return datetime_now(APP_TZ)
+
+def datetime_now(tz):
+    return dt.datetime.now(tz)
 
 def between_working_hours(kst: dt.datetime, start=8, end=20) -> bool:
     return start <= kst.hour < end
@@ -73,11 +71,28 @@ def _naver_sid(url: str) -> str | None:
         return None
 
 def sha1(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()
 
-# -------------------------
-# 외부 API
-# -------------------------
+def load_sent_cache() -> set[str]:
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            arr = json.load(f)
+            return set(arr if isinstance(arr, list) else [])
+    except Exception:
+        return set()
+
+def save_sent_cache(hashes: set[str]) -> None:
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(hashes)), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("전송 캐시 저장 실패: %s", e)
+
+def prune_cache(hashes: set[str], keep: int = 5000) -> set[str]:
+    if len(hashes) <= keep:
+        return hashes
+    return set(list(hashes)[-keep:])
+
 def search_newsapi(query: str, page_size: int, api_key: str, from_hours: int = 72, cfg: dict | None = None):
     if not api_key or not query:
         return []
@@ -165,9 +180,6 @@ def search_naver_news(keyword: str, display: int, offset: int, client_id: str, c
         log.warning("Naver 오류(%s): %s", keyword, e)
         return []
 
-# -------------------------
-# 필터/스코어/중복
-# -------------------------
 def should_drop(item: dict, cfg: dict) -> bool:
     url = item.get("url", "")
     title = (item.get("title") or "").strip()
@@ -184,7 +196,6 @@ def should_drop(item: dict, cfg: dict) -> bool:
     if allow_strict and allow and (src not in allow):
         return True
 
-    # 네이버 섹션 필터(경제면=101 등)
     if "naver.com" in src:
         sids = set(cfg.get("NAVER_ALLOW_SIDS", []) or [])
         if sids:
@@ -192,12 +203,10 @@ def should_drop(item: dict, cfg: dict) -> bool:
             if sid not in sids:
                 return True
 
-    # 제외 키워드
     for w in (cfg.get("EXCLUDE_TITLE_KEYWORDS", []) or []):
         if w and w.lower() in title.lower():
             return True
 
-    # 포함 키워드 + 별칭(필수 적중)
     include = (cfg.get("INCLUDE_TITLE_KEYWORDS", []) or [])
     aliases = _alias_flatten(cfg.get("KEYWORD_ALIASES") or {})
     must = include + aliases
@@ -211,11 +220,9 @@ def score_item(item: dict, cfg: dict) -> float:
     title = item.get("title") or ""
     score = 0.0
 
-    # 도메인 가중치
     weights = cfg.get("DOMAIN_WEIGHTS", {}) or {}
     score += float(weights.get(src, 1.0))
 
-    # 키워드 적중 보너스
     hit_bonus = 0.0
     for kw in cfg.get("KEYWORDS", []):
         if kw and kw.lower() in title.lower():
@@ -225,7 +232,6 @@ def score_item(item: dict, cfg: dict) -> float:
             hit_bonus += 0.5
     score += hit_bonus
 
-    # 신선도 보정
     try:
         ts = item.get("publishedAt")
         pub = dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.utc)
@@ -278,24 +284,22 @@ def pick_top10(items: list[dict], cfg: dict) -> list[dict]:
             break
     return out
 
-# -------------------------
-# Telegram
-# -------------------------
 def format_telegram_block(title: str, items: list[dict]) -> str:
     if not items:
         return ""
     lines = [f"📌 <b>{title}</b>"]
     for it in items:
-        src = domain_of(it.get("url", ""))
+        t = it.get("title", "").strip()
+        u = it.get("url", "")
+        line = f"• <a href=\"{u}\">{t}</a>"
         try:
             pub = dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.utc).astimezone(APP_TZ)
             when = pub.strftime("%Y-%m-%d %H:%M")
+            line += f" ({when})"
         except Exception:
-            when = ""
-        t = it.get("title", "").strip()
-        u = it.get("url", "")
-        lines.append(f"• {t} ({u}) — {src} ({when})")
-    return "\\n".join(lines)
+            pass
+        lines.append(line)
+    return "\n".join(lines)
 
 def send_telegram(bot_token: str, chat_id: str, text: str, disable_web_page_preview: bool = True):
     if not bot_token or not chat_id:
@@ -315,9 +319,6 @@ def send_telegram(bot_token: str, chat_id: str, text: str, disable_web_page_prev
         log.warning("텔레그램 전송 실패: %s", e)
         return False
 
-# -------------------------
-# 수집/전송
-# -------------------------
 def transmit_once(cfg: dict, preview_mode: bool, env: dict):
     keywords = cfg.get("KEYWORDS", []) or []
     page_size = int(cfg.get("PAGE_SIZE", 30))
@@ -331,7 +332,6 @@ def transmit_once(cfg: dict, preview_mode: bool, env: dict):
 
     all_items = []
 
-    # NAVER — 키워드별 개별 조회
     naver_hits = 0
     for kw in keywords:
         batch = search_naver_news(
@@ -342,7 +342,6 @@ def transmit_once(cfg: dict, preview_mode: bool, env: dict):
         all_items += batch
         time.sleep(0.2)
 
-    # NEWSAPI — OR 쿼리(단, 내부에서 title 제한/도메인 제한)
     newsapi_hits = 0
     if newsapi_key and keywords:
         query = " OR ".join(keywords)
@@ -352,12 +351,12 @@ def transmit_once(cfg: dict, preview_mode: bool, env: dict):
 
     raw_count = len(all_items)
 
-    # 필터/스코어/Top10
-    _stage = [it for it in all_items if not should_drop(it, cfg)]
-    after_filter = len(_stage)
-    for it in _stage:
+    filtered = [it for it in all_items if not should_drop(it, cfg)]
+    after_filter = len(filtered)
+    for it in filtered:
         it["_score"] = score_item(it, cfg)
-    _stage.sort(key=lambda x: x["_score"], reverse=True)
+    filtered.sort(key=lambda x: x["_score"], reverse=True)
+
     top10 = pick_top10(all_items, cfg)
 
     if preview_mode:
@@ -373,7 +372,6 @@ def transmit_once(cfg: dict, preview_mode: bool, env: dict):
             }
         }
 
-    # 전송 정책
     kst_now = now_kst()
     if cfg.get("ONLY_WORKING_HOURS") and not between_working_hours(kst_now, 8, 20):
         log.info("업무시간 외 — 전송 생략")
@@ -385,28 +383,41 @@ def transmit_once(cfg: dict, preview_mode: bool, env: dict):
         log.info("공휴일 — 전송 생략")
         return {"picked": len(top10), "sent": 0, "items": top10}
 
-    if not top10:
-        log.info("전송할 기사 없음")
+    cache = load_sent_cache()
+
+    new_items = [it for it in top10 if sha1(it.get("url", "")) not in cache]
+
+    if not new_items:
+        alt = dedup(filtered)[:20]
+        new_items = [it for it in alt if sha1(it.get("url", "")) not in cache]
+        log.info("신규 기사 없음 → 기존 상위 20건 중 미전송 기사 재사용")
+
+    if not new_items:
+        log.info("전송할 (신규/대체) 기사 없음")
         return {"picked": 0, "sent": 0, "items": []}
 
-    text = format_telegram_block("Top 10", top10)
+    text = format_telegram_block("Top 10", new_items)
     ok = send_telegram(
         bot_token, chat_id, text,
         disable_web_page_preview=bool(cfg.get("TELEGRAM_DISABLE_PREVIEW", True))
     )
-    return {"picked": len(top10), "sent": (1 if ok else 0), "items": top10}
+
+    if ok:
+        cache |= {sha1(it.get("url", "")) for it in new_items}
+        cache = prune_cache(cache)
+        save_sent_cache(cache)
+
+    return {"picked": len(new_items), "sent": (1 if ok else 0), "items": new_items}
 
 # -------------------------
 # Streamlit UI
 # -------------------------
-st.set_page_config(page_title="PE 동향 뉴스 → Telegram 자동 전송 (fixed)", page_icon="📰", layout="wide")
+st.set_page_config(page_title="PE 동향 뉴스 → Telegram 자동 전송", page_icon="📰", layout="wide")
 
-# config 파일 경로 입력 가능(기본: 확장본)
 cfg_path = st.sidebar.text_input("config.json 경로", value=DEFAULT_CONFIG_PATH)
 cfg = load_config(cfg_path)
 st.sidebar.caption(f"CONFIG 경로: {cfg_path} / 존재: {'True' if cfg else 'False'}")
 
-# 자격증명(선택)
 newsapi_key = st.sidebar.text_input("NewsAPI Key (선택)", type="password", value=os.getenv("NEWSAPI_KEY", ""))
 naver_id = st.sidebar.text_input("Naver Client ID (선택)", type="password", value=os.getenv("NAVER_CLIENT_ID", ""))
 naver_secret = st.sidebar.text_input("Naver Client Secret (선택)", type="password", value=os.getenv("NAVER_CLIENT_SECRET", ""))
@@ -420,7 +431,6 @@ cfg["MAX_PER_KEYWORD"] = st.sidebar.number_input("전송 건수 제한(키워드
 cfg["INTERVAL_MIN"] = st.sidebar.number_input("전송 주기(분)", min_value=15, max_value=360, step=5, value=int(cfg.get("INTERVAL_MIN", 60)))
 cfg["RECENCY_HOURS"] = st.sidebar.number_input("신선도(최근 N시간)", min_value=6, max_value=168, step=6, value=int(cfg.get("RECENCY_HOURS", 72)))
 
-# ✅ 체크박스: 즉시 반영 (저장은 별도)
 cfg["ONLY_WORKING_HOURS"] = st.sidebar.checkbox("✅ 업무시간(08~20 KST) 내 전송", value=bool(cfg.get("ONLY_WORKING_HOURS", True)))
 cfg["TELEGRAM_DISABLE_PREVIEW"] = st.sidebar.checkbox("🔗 링크 프리뷰 비활성화", value=bool(cfg.get("TELEGRAM_DISABLE_PREVIEW", True)))
 cfg["BLOCK_WEEKEND"] = st.sidebar.checkbox("🚫 주말 미전송", value=bool(cfg.get("BLOCK_WEEKEND", True)))
@@ -432,11 +442,10 @@ if st.sidebar.button("구성 리로드", use_container_width=True):
     cfg = load_config(cfg_path)
     st.rerun()
 
-# 키워드 확인
 st.sidebar.caption("KEYWORDS (일부)")
 st.sidebar.code(", ".join(cfg.get("KEYWORDS", [])[:20]) or "(none)", language="text")
 
-st.title("📰 PE 동향 뉴스 ➜ Telegram 자동 전송 (fixed)")
+st.title("📰 PE 동향 뉴스 ➜ Telegram 자동 전송")
 st.caption("Streamlit + NewsAPI/Naver + Telegram + APScheduler")
 
 col1, col2, col3, col4 = st.columns([1,1,1,1])
@@ -497,7 +506,6 @@ with col4:
 st.subheader("상태")
 st.info(f"Scheduler 실행 중: {st.session_state['sched_started']}")
 
-# 미리보기
 st.subheader("미리보기: 최신 10건")
 res = st.session_state.get("preview", {})
 items = res.get("items", [])
@@ -508,7 +516,6 @@ with st.expander(f"Top 10 — {len(items)}건", expanded=True):
         st.write("결과 없음")
     else:
         for it in items:
-            src = domain_of(it.get("url", ""))
             title = it.get("title", "")
             url = it.get("url", "")
             try:
@@ -516,7 +523,7 @@ with st.expander(f"Top 10 — {len(items)}건", expanded=True):
                 when = pub.strftime("%Y-%m-%d %H:%M")
             except Exception:
                 when = "-"
-            st.markdown(f"- **{title}**  \n  {url}  — *{src}* ({when})")
+            st.markdown(f"- <a href=\"{url}\"><b>{title}</b></a> ({when})", unsafe_allow_html=True)
 
 if diag:
     st.caption(f"수집: Naver {diag.get('naver_hits',0)} / NewsAPI {diag.get('newsapi_hits',0)} • 원시합계: {diag.get('raw',0)} → 필터후: {diag.get('after_filter',0)} → Top10: {len(items)}")
