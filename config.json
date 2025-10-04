@@ -62,7 +62,7 @@
   "SKIP_WEEKENDS": true,
   "SKIP_HOLIDAYS": true,
   "HOLIDAYS_KR": [
-    "2025-01-01", "2025-02-28"  // 필요에 따라 추가
+    "2025-01-01", "2025-02-28"
   ],
 
   "TELEGRAM_DISABLE_PREVIEW": true,
