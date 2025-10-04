@@ -12,6 +12,7 @@ from typing import Optional, List, Dict, Set
 import pytz
 import streamlit as st
 from apscheduler.schedulers.background import BackgroundScheduler
+from threading import Lock
 
 # -------------------------
 # 기본 설정 / 전역 상태
@@ -407,43 +408,58 @@ def _should_skip_by_time(cfg: dict) -> bool:
         return True
     return False
 
+# -------------------------
+# 실행 겹침 방지 락
+# -------------------------
+@st.cache_resource(show_spinner=False)
+def get_run_lock() -> Lock:
+    return Lock()
+
 def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
-    # 전체 수집 → 필터/정렬 → 전체 리스트
-    all_items = collect_all(cfg, env)
-    ranked = rank_filtered(all_items, cfg)
-
-    if preview:
-        return {"count": len(ranked), "items": ranked}
-
-    # 전송 타임 필터
-    if _should_skip_by_time(cfg):
-        log.info("시간 정책에 의해 전송 건너뜀 (업무시간/주말/공휴일)")
+    # 실행 겹침 방지 (동시에 두 번 이상 돌지 않도록)
+    run_lock = get_run_lock()
+    if not run_lock.acquire(blocking=False):
+        log.info("다른 실행이 진행 중이어서 이번 주기는 스킵합니다.")
         return {"count": 0, "items": []}
+    try:
+        # 전체 수집 → 필터/정렬 → 전체 리스트
+        all_items = collect_all(cfg, env)
+        ranked = rank_filtered(all_items, cfg)
 
-    # 신규만 전송 (캐시 기준)
-    cache = load_sent_cache()
-    new_items = [it for it in ranked if sha1(it.get("url", "")) not in cache]
+        if preview:
+            return {"count": len(ranked), "items": ranked}
 
-    # 신규 없으면 알림
-    if not new_items:
-        send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), "📭 신규 뉴스 없음")
-        return {"count": 0, "items": []}
+        # 전송 타임 필터
+        if _should_skip_by_time(cfg):
+            log.info("시간 정책에 의해 전송 건너뜀 (업무시간/주말/공휴일)")
+            return {"count": 0, "items": []}
 
-    # 텔레그램 4096자 제한 대비 — 30개 단위로 배치 전송
-    BATCH = 30
-    sent_any = False
-    for i in range(0, len(new_items), BATCH):
-        chunk = new_items[i:i+BATCH]
-        text = format_telegram_text(chunk)
-        ok = send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), text)
-        sent_any = sent_any or ok
-        time.sleep(0.6)
+        # 신규만 전송 (캐시 기준)
+        cache = load_sent_cache()
+        new_items = [it for it in ranked if sha1(it.get("url", "")) not in cache]
 
-    if sent_any:
-        cache |= {sha1(it.get("url", "")) for it in new_items}
-        save_sent_cache(cache)
+        # 신규 없으면 알림
+        if not new_items:
+            send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), "📭 신규 뉴스 없음")
+            return {"count": 0, "items": []}
 
-    return {"count": len(new_items), "items": new_items}
+        # 텔레그램 4096자 제한 대비 — 30개 단위로 배치 전송
+        BATCH = 30
+        sent_any = False
+        for i in range(0, len(new_items), BATCH):
+            chunk = new_items[i:i+BATCH]
+            text = format_telegram_text(chunk)
+            ok = send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), text)
+            sent_any = sent_any or ok
+            time.sleep(0.6)
+
+        if sent_any:
+            cache |= {sha1(it.get("url", "")) for it in new_items}
+            save_sent_cache(cache)
+
+        return {"count": len(new_items), "items": new_items}
+    finally:
+        run_lock.release()
 
 # -------------------------
 # 스케줄러 (rerun-safe)
@@ -468,6 +484,7 @@ def ensure_interval_job(sched: BackgroundScheduler, minutes: int):
         sched.remove_job(job_id)
     except Exception:
         pass
+    # next_run_time=now → 스케줄러가 즉시 1회 실행을 트리거 (수동 호출 금지)
     sched.add_job(scheduled_job, "interval", minutes=minutes, id=job_id,
                   replace_existing=True, next_run_time=now_kst())
 
@@ -485,8 +502,7 @@ def start_schedule(cfg_path: str, cfg_dict: dict, env: dict, minutes: int):
     CURRENT_ENV = env
     sched = get_scheduler()
     ensure_interval_job(sched, minutes)
-    # 즉시 1회 수행
-    scheduled_job()
+    # 주의: 즉시 실행은 스케줄러 next_run_time으로만 유도(수동 scheduled_job() 호출 금지)
 
 def stop_schedule():
     sched = get_scheduler()
@@ -565,7 +581,7 @@ with col2:
 with col3:
     if st.button("스케줄 시작"):
         start_schedule(cfg_path=cfg_path, cfg_dict=cfg, env=make_env(), minutes=int(cfg["INTERVAL_MIN"]))
-        st.success("스케줄 시작됨 (즉시 전송 후 주기 실행)")
+        st.success("스케줄 시작됨 (즉시 1회 전송 후 주기 실행)")
 
 with col4:
     if st.button("스케줄 중지"):
