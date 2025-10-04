@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -8,17 +9,27 @@ import logging
 import requests
 import datetime as dt
 from urllib.parse import urlparse, parse_qs
+from typing import Optional, List, Dict, Any, Set
 
 import pytz
 import streamlit as st
 from apscheduler.schedulers.background import BackgroundScheduler
 
 APP_TZ = pytz.timezone("Asia/Seoul")
-DEFAULT_CONFIG_PATH = "config.json"
-CACHE_FILE = "sent_cache.json"
+DEFAULT_CONFIG_PATH = os.getenv("PE_CFG", "config.json")
+CACHE_FILE = os.getenv("PE_SENT_CACHE", "sent_cache.json")
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("pe_monitor_fixed")
+log = logging.getLogger("pe_monitor")
+
+CURRENT_CFG_PATH = DEFAULT_CONFIG_PATH
+CURRENT_ENV = {
+    "NEWSAPI_KEY": os.getenv("NEWSAPI_KEY", ""),
+    "NAVER_CLIENT_ID": os.getenv("NAVER_CLIENT_ID", ""),
+    "NAVER_CLIENT_SECRET": os.getenv("NAVER_CLIENT_SECRET", ""),
+    "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+    "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", ""),
+}
 
 def load_config(path: str) -> dict:
     try:
@@ -29,10 +40,7 @@ def load_config(path: str) -> dict:
         return {}
 
 def now_kst():
-    return datetime_now(APP_TZ)
-
-def datetime_now(tz):
-    return dt.datetime.now(tz)
+    return dt.datetime.now(APP_TZ)
 
 def between_working_hours(kst: dt.datetime, start=8, end=20) -> bool:
     return start <= kst.hour < end
@@ -40,7 +48,7 @@ def between_working_hours(kst: dt.datetime, start=8, end=20) -> bool:
 def is_weekend(kst: dt.datetime) -> bool:
     return kst.weekday() >= 5
 
-def is_holiday(kst: dt.datetime, holidays: list[str]) -> bool:
+def is_holiday(kst: dt.datetime, holidays: List[str]) -> bool:
     ymd = kst.strftime("%Y-%m-%d")
     return ymd in set(holidays or [])
 
@@ -53,17 +61,17 @@ def domain_of(url: str) -> str:
     except Exception:
         return ""
 
-def _token_hit(text: str, tokens: list[str]) -> bool:
+def _token_hit(text: str, tokens: List[str]) -> bool:
     t = (text or "").lower()
     return any((tok or "").lower() in t for tok in (tokens or []))
 
-def _alias_flatten(alias_map: dict) -> list[str]:
+def _alias_flatten(alias_map: Dict[str, List[str]]) -> List[str]:
     vals = []
     for v in (alias_map or {}).values():
         vals.extend(v or [])
     return sorted({s.strip() for s in vals if s and s.strip()})
 
-def _naver_sid(url: str) -> str | None:
+def _naver_sid(url: str) -> Optional[str]:
     try:
         q = parse_qs(urlparse(url).query).get("sid", [])
         return q[0] if q else None
@@ -73,7 +81,7 @@ def _naver_sid(url: str) -> str | None:
 def sha1(text: str) -> str:
     return hashlib.sha1((text or "").encode("utf-8")).hexdigest()
 
-def load_sent_cache() -> set[str]:
+def load_sent_cache() -> Set[str]:
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             arr = json.load(f)
@@ -81,14 +89,14 @@ def load_sent_cache() -> set[str]:
     except Exception:
         return set()
 
-def save_sent_cache(hashes: set[str]) -> None:
+def save_sent_cache(hashes: Set[str]) -> None:
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(sorted(list(hashes)), f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.warning("전송 캐시 저장 실패: %s", e)
 
-def prune_cache(hashes: set[str], keep: int = 5000) -> set[str]:
+def prune_cache(hashes: Set[str], keep: int = 5000) -> Set[str]:
     if len(hashes) <= keep:
         return hashes
     return set(list(hashes)[-keep:])
@@ -97,7 +105,7 @@ def search_newsapi(query: str, page_size: int, api_key: str, from_hours: int = 7
     if not api_key or not query:
         return []
     base = "https://newsapi.org/v2/everything"
-    from_dt = (now_kst() - dt.timedelta(hours=from_hours)).astimezone(pytz.utc)
+    from_dt = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=from_hours))
     params = {
         "q": (cfg.get("NEWSAPI_QUERY") if (cfg and cfg.get("NEWSAPI_QUERY")) else query),
         "searchIn": "title",
@@ -170,7 +178,7 @@ def search_naver_news(keyword: str, display: int, offset: int, client_id: str, c
                 "title": title,
                 "url": link,
                 "source": domain_of(link),
-                "publishedAt": pub_kst.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "publishedAt": pub_kst.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "summary": desc,
                 "provider": "naver",
                 "origin_keyword": keyword,
@@ -234,15 +242,15 @@ def score_item(item: dict, cfg: dict) -> float:
 
     try:
         ts = item.get("publishedAt")
-        pub = dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.utc)
+        pub = dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
     except Exception:
         pub = now_kst()
-    hours_ago = (now_kst() - pub.astimezone(APP_TZ)).total_seconds() / 3600.0
+    hours_ago = (now_kst() - pub.astimezone(pytz.timezone("Asia/Seoul"))).total_seconds() / 3600.0
     score += max(0.0, 6.0 - (hours_ago / 8.0))
 
     return score
 
-def dedup(items: list[dict], threshold: float = 0.82) -> list[dict]:
+def dedup(items: List[dict], threshold: float = 0.82) -> List[dict]:
     def norm(s: str) -> str:
         s = re.sub(r"[\\[\\]\\(\\)【】『』“”\"'<>]", " ", s or "")
         s = re.sub(r"\\s+", " ", s).strip().lower()
@@ -266,15 +274,18 @@ def dedup(items: list[dict], threshold: float = 0.82) -> list[dict]:
             out.append(it)
     return out
 
-def pick_top10(items: list[dict], cfg: dict) -> list[dict]:
+def rank_filtered(items: List[dict], cfg: dict) -> List[dict]:
     filtered = [it for it in items if not should_drop(it, cfg)]
     for it in filtered:
         it["_score"] = score_item(it, cfg)
     filtered.sort(key=lambda x: x["_score"], reverse=True)
-    unique = dedup(filtered)
+    return dedup(filtered)
+
+def pick_top10(items: List[dict], cfg: dict) -> List[dict]:
+    ranked = rank_filtered(items, cfg)
     cap = int(cfg.get("MAX_PER_KEYWORD", 8))
     bucket, out = {}, []
-    for it in unique:
+    for it in ranked:
         k = it.get("origin_keyword") or "_"
         c = bucket.get(k, 0)
         if c < cap:
@@ -284,7 +295,7 @@ def pick_top10(items: list[dict], cfg: dict) -> list[dict]:
             break
     return out
 
-def format_telegram_block(title: str, items: list[dict]) -> str:
+def format_telegram_block(title: str, items: List[dict]) -> str:
     if not items:
         return ""
     lines = [f"📌 <b>{title}</b>"]
@@ -293,7 +304,7 @@ def format_telegram_block(title: str, items: list[dict]) -> str:
         u = it.get("url", "")
         line = f"• <a href=\"{u}\">{t}</a>"
         try:
-            pub = dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.utc).astimezone(APP_TZ)
+            pub = dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).astimezone(APP_TZ)
             when = pub.strftime("%Y-%m-%d %H:%M")
             line += f" ({when})"
         except Exception:
@@ -301,7 +312,7 @@ def format_telegram_block(title: str, items: list[dict]) -> str:
         lines.append(line)
     return "\n".join(lines)
 
-def send_telegram(bot_token: str, chat_id: str, text: str, disable_web_page_preview: bool = True):
+def send_telegram(bot_token: str, chat_id: str, text: str, disable_web_page_preview: bool = True) -> bool:
     if not bot_token or not chat_id:
         return False
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -319,104 +330,102 @@ def send_telegram(bot_token: str, chat_id: str, text: str, disable_web_page_prev
         log.warning("텔레그램 전송 실패: %s", e)
         return False
 
-def transmit_once(cfg: dict, preview_mode: bool, env: dict):
+def collect_all(cfg: dict, env: dict) -> List[dict]:
     keywords = cfg.get("KEYWORDS", []) or []
     page_size = int(cfg.get("PAGE_SIZE", 30))
     recency_hours = int(cfg.get("RECENCY_HOURS", 72))
 
-    newsapi_key = env.get("NEWSAPI_KEY", os.getenv("NEWSAPI_KEY", ""))
-    naver_id = env.get("NAVER_CLIENT_ID", os.getenv("NAVER_CLIENT_ID", ""))
-    naver_secret = env.get("NAVER_CLIENT_SECRET", os.getenv("NAVER_CLIENT_SECRET", ""))
-    bot_token = env.get("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", ""))
-    chat_id = env.get("TELEGRAM_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", ""))
+    newsapi_key = env.get("NEWSAPI_KEY", "")
+    naver_id = env.get("NAVER_CLIENT_ID", "")
+    naver_secret = env.get("NAVER_CLIENT_SECRET", "")
 
-    all_items = []
+    all_items: List[dict] = []
 
-    naver_hits = 0
     for kw in keywords:
         batch = search_naver_news(
             kw, display=max(3, page_size // 3), offset=1,
             client_id=naver_id, client_secret=naver_secret, recency_hours=recency_hours
         )
-        naver_hits += len(batch)
         all_items += batch
         time.sleep(0.2)
 
-    newsapi_hits = 0
     if newsapi_key and keywords:
         query = " OR ".join(keywords)
         batch = search_newsapi(query, page_size=page_size, api_key=newsapi_key, from_hours=recency_hours, cfg=cfg)
-        newsapi_hits = len(batch)
         all_items += batch
 
-    raw_count = len(all_items)
+    return all_items
 
-    filtered = [it for it in all_items if not should_drop(it, cfg)]
-    after_filter = len(filtered)
-    for it in filtered:
-        it["_score"] = score_item(it, cfg)
-    filtered.sort(key=lambda x: x["_score"], reverse=True)
-
+def transmit_once(cfg: dict, preview_mode: bool, env: dict) -> dict:
+    all_items = collect_all(cfg, env)
+    ranked = rank_filtered(all_items, cfg)
     top10 = pick_top10(all_items, cfg)
 
     if preview_mode:
-        return {
-            "picked": len(top10),
-            "sent": 0,
-            "items": top10,
-            "diag": {
-                "naver_hits": naver_hits,
-                "newsapi_hits": newsapi_hits,
-                "raw": raw_count,
-                "after_filter": after_filter
-            }
-        }
+        return {"picked": len(top10), "sent": 0, "top10": top10, "all": ranked}
 
     kst_now = now_kst()
     if cfg.get("ONLY_WORKING_HOURS") and not between_working_hours(kst_now, 8, 20):
         log.info("업무시간 외 — 전송 생략")
-        return {"picked": len(top10), "sent": 0, "items": top10}
+        return {"picked": len(top10), "sent": 0, "top10": top10, "all": ranked}
     if cfg.get("BLOCK_WEEKEND") and is_weekend(kst_now):
         log.info("주말 — 전송 생략")
-        return {"picked": len(top10), "sent": 0, "items": top10}
+        return {"picked": len(top10), "sent": 0, "top10": top10, "all": ranked}
     if cfg.get("BLOCK_HOLIDAY") and is_holiday(kst_now, cfg.get("HOLIDAYS", [])):
         log.info("공휴일 — 전송 생략")
-        return {"picked": len(top10), "sent": 0, "items": top10}
+        return {"picked": len(top10), "sent": 0, "top10": top10, "all": ranked}
 
     cache = load_sent_cache()
-
-    new_items = [it for it in top10 if sha1(it.get("url", "")) not in cache]
-
-    if not new_items:
-        alt = dedup(filtered)[:20]
-        new_items = [it for it in alt if sha1(it.get("url", "")) not in cache]
-        log.info("신규 기사 없음 → 기존 상위 20건 중 미전송 기사 재사용")
+    new_items = [it for it in ranked[:50] if sha1(it.get("url", "")) not in cache]
 
     if not new_items:
-        log.info("전송할 (신규/대체) 기사 없음")
-        return {"picked": 0, "sent": 0, "items": []}
+        info_text = "📭 신규 뉴스 없음"
+        ok = send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), info_text,
+                           disable_web_page_preview=bool(cfg.get("TELEGRAM_DISABLE_PREVIEW", True)))
+        return {"picked": 0, "sent": (1 if ok else 0), "top10": top10, "all": ranked}
 
-    text = format_telegram_block("Top 10", new_items)
-    ok = send_telegram(
-        bot_token, chat_id, text,
-        disable_web_page_preview=bool(cfg.get("TELEGRAM_DISABLE_PREVIEW", True))
-    )
+    text = format_telegram_block("Top Updates", new_items[:10])
+    ok = send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), text,
+                       disable_web_page_preview=bool(cfg.get("TELEGRAM_DISABLE_PREVIEW", True)))
 
     if ok:
         cache |= {sha1(it.get("url", "")) for it in new_items}
         cache = prune_cache(cache)
         save_sent_cache(cache)
 
-    return {"picked": len(new_items), "sent": (1 if ok else 0), "items": new_items}
+    return {"picked": len(new_items[:10]), "sent": (1 if ok else 0), "top10": top10, "all": ranked}
 
-# -------------------------
-# Streamlit UI
-# -------------------------
+@st.cache_resource(show_spinner=False)
+def get_scheduler() -> BackgroundScheduler:
+    sched = BackgroundScheduler(timezone=APP_TZ)
+    sched.start()
+    return sched
+
+def scheduled_job():
+    cfg = load_config(CURRENT_CFG_PATH)
+    res = transmit_once(cfg, preview_mode=False, env=CURRENT_ENV)
+    log.info("Scheduled: sent=%s picked=%s", res.get("sent"), res.get("picked"))
+
+def ensure_interval_job(sched: BackgroundScheduler, minutes: int):
+    job_id = "newsjob"
+    try:
+        sched.remove_job(job_id)
+    except Exception:
+        pass
+    sched.add_job(scheduled_job, "interval", minutes=minutes, id=job_id,
+                  replace_existing=True, next_run_time=now_kst()+dt.timedelta(seconds=3))
+
+def is_running(sched: BackgroundScheduler) -> bool:
+    try:
+        return any(j.id == "newsjob" for j in sched.get_jobs())
+    except Exception:
+        return False
+
 st.set_page_config(page_title="PE 동향 뉴스 → Telegram 자동 전송", page_icon="📰", layout="wide")
 
 cfg_path = st.sidebar.text_input("config.json 경로", value=DEFAULT_CONFIG_PATH)
 cfg = load_config(cfg_path)
-st.sidebar.caption(f"CONFIG 경로: {cfg_path} / 존재: {'True' if cfg else 'False'}")
+st.sidebar.caption(f"CONFIG 존재: {'True' if cfg else 'False'} · 경로: {cfg_path}")
 
 newsapi_key = st.sidebar.text_input("NewsAPI Key (선택)", type="password", value=os.getenv("NEWSAPI_KEY", ""))
 naver_id = st.sidebar.text_input("Naver Client ID (선택)", type="password", value=os.getenv("NAVER_CLIENT_ID", ""))
@@ -428,7 +437,7 @@ st.sidebar.divider()
 st.sidebar.subheader("전송/수집 파라미터")
 cfg["PAGE_SIZE"] = st.sidebar.number_input("페이지당 수집 수", min_value=10, max_value=100, step=1, value=int(cfg.get("PAGE_SIZE", 30)))
 cfg["MAX_PER_KEYWORD"] = st.sidebar.number_input("전송 건수 제한(키워드별)", min_value=3, max_value=20, step=1, value=int(cfg.get("MAX_PER_KEYWORD", 8)))
-cfg["INTERVAL_MIN"] = st.sidebar.number_input("전송 주기(분)", min_value=15, max_value=360, step=5, value=int(cfg.get("INTERVAL_MIN", 60)))
+cfg["INTERVAL_MIN"] = st.sidebar.number_input("전송 주기(분)", min_value=5, max_value=360, step=5, value=int(cfg.get("INTERVAL_MIN", 60)))
 cfg["RECENCY_HOURS"] = st.sidebar.number_input("신선도(최근 N시간)", min_value=6, max_value=168, step=6, value=int(cfg.get("RECENCY_HOURS", 72)))
 
 cfg["ONLY_WORKING_HOURS"] = st.sidebar.checkbox("✅ 업무시간(08~20 KST) 내 전송", value=bool(cfg.get("ONLY_WORKING_HOURS", True)))
@@ -439,18 +448,14 @@ cfg["ALLOWLIST_STRICT"] = st.sidebar.checkbox("🧱 ALLOWLIST_STRICT (허용 도
 
 st.sidebar.divider()
 if st.sidebar.button("구성 리로드", use_container_width=True):
-    cfg = load_config(cfg_path)
-    st.rerun()
-
-st.sidebar.caption("KEYWORDS (일부)")
-st.sidebar.code(", ".join(cfg.get("KEYWORDS", [])[:20]) or "(none)", language="text")
+    st.experimental_rerun()
 
 st.title("📰 PE 동향 뉴스 ➜ Telegram 자동 전송")
-st.caption("Streamlit + NewsAPI/Naver + Telegram + APScheduler")
+st.caption("Streamlit + NewsAPI/Naver + Telegram + APScheduler (Render + UptimeRobot)")
 
 col1, col2, col3, col4 = st.columns([1,1,1,1])
 
-def transmit_env():
+def make_env_from_inputs():
     return {
         "NEWSAPI_KEY": newsapi_key,
         "NAVER_CLIENT_ID": naver_id,
@@ -461,69 +466,68 @@ def transmit_env():
 
 with col1:
     if st.button("지금 한번 실행(미리보기)", type="primary"):
-        res = transmit_once(cfg, preview_mode=True, env=transmit_env())
+        res = transmit_once(cfg, preview_mode=True, env=make_env_from_inputs())
         st.session_state["preview"] = res
 
 with col2:
     if st.button("지금 한번 전송"):
-        res = transmit_once(cfg, preview_mode=False, env=transmit_env())
+        res = transmit_once(cfg, preview_mode=False, env=make_env_from_inputs())
         st.session_state["preview"] = res
 
-SCHED = BackgroundScheduler(timezone=APP_TZ)
-if "sched_started" not in st.session_state:
-    st.session_state["sched_started"] = False
+sched = get_scheduler()
 
-def scheduled_job():
-    try:
-        transmit_once(cfg, preview_mode=False, env={
-            "NEWSAPI_KEY": os.getenv("NEWSAPI_KEY", ""),
-            "NAVER_CLIENT_ID": os.getenv("NAVER_CLIENT_ID", ""),
-            "NAVER_CLIENT_SECRET": os.getenv("NAVER_CLIENT_SECRET", ""),
-            "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
-            "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", ""),
-        })
-    except Exception as e:
-        log.exception("스케줄 작업 실패: %s", e)
+def on_start_schedule():
+    global CURRENT_CFG_PATH, CURRENT_ENV
+    CURRENT_CFG_PATH = cfg_path
+    CURRENT_ENV = make_env_from_inputs()
+    minutes = int(cfg.get("INTERVAL_MIN", 60))
+    ensure_interval_job(sched, minutes)
 
 with col3:
-    if not st.session_state["sched_started"]:
-        if st.button("스케줄 시작"):
-            minutes = int(cfg.get("INTERVAL_MIN", 60))
-            SCHED.add_job(scheduled_job, "interval", minutes=minutes, id="job1", replace_existing=True, next_run_time=now_kst()+dt.timedelta(seconds=3))
-            SCHED.start()
-            st.session_state["sched_started"] = True
-    else:
-        st.button("스케줄 시작", disabled=True)
+    if st.button("스케줄 시작"):
+        on_start_schedule()
 
 with col4:
     if st.button("스케줄 중지"):
         try:
-            SCHED.shutdown(wait=False)
+            for j in sched.get_jobs():
+                sched.remove_job(j.id)
         except Exception:
             pass
-        st.session_state["sched_started"] = False
 
+_running = is_running(sched)
 st.subheader("상태")
-st.info(f"Scheduler 실행 중: {st.session_state['sched_started']}")
+st.info(f"Scheduler 실행 중: {_running}")
 
-st.subheader("미리보기: 최신 10건")
-res = st.session_state.get("preview", {})
-items = res.get("items", [])
-diag = res.get("diag", {})
+res = st.session_state.get("preview", {"top10": [], "all": []})
+top_items = res.get("top10", [])
+all_items = res.get("all", [])
 
-with st.expander(f"Top 10 — {len(items)}건", expanded=True):
-    if not items:
+st.subheader(f"Top 10 — {len(top_items)}건")
+if not top_items:
+    st.write("결과 없음")
+else:
+    for it in top_items:
+        t = it.get("title", "")
+        u = it.get("url", "")
+        try:
+            pub = dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).astimezone(APP_TZ)
+            when = pub.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            when = "-"
+        st.markdown(f"- <a href=\"{u}\"><b>{t}</b></a> ({when})", unsafe_allow_html=True)
+
+st.subheader(f"전체 필터링 기사 — {len(all_items)}건")
+with st.expander("전체 목록 보기", expanded=False):
+    if not all_items:
         st.write("결과 없음")
     else:
-        for it in items:
-            title = it.get("title", "")
-            url = it.get("url", "")
+        for it in all_items:
+            t = it.get("title", "")
+            u = it.get("url", "")
             try:
-                pub = dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.utc).astimezone(APP_TZ)
+                pub = dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).astimezone(APP_TZ)
                 when = pub.strftime("%Y-%m-%d %H:%M")
             except Exception:
                 when = "-"
-            st.markdown(f"- <a href=\"{url}\"><b>{title}</b></a> ({when})", unsafe_allow_html=True)
-
-if diag:
-    st.caption(f"수집: Naver {diag.get('naver_hits',0)} / NewsAPI {diag.get('newsapi_hits',0)} • 원시합계: {diag.get('raw',0)} → 필터후: {diag.get('after_filter',0)} → Top10: {len(items)}")
+            st.markdown(f"- <a href=\"{u}\">{t}</a> ({when})", unsafe_allow_html=True)
