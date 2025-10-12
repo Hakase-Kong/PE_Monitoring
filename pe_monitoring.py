@@ -449,8 +449,7 @@ def format_telegram_text(items: List[dict]) -> str:
         except Exception:
             when = "-"
         lines.append(f"• <a href=\"{u}\">{t}</a> — {src} ({when})")
-    return "
-".join(lines)
+    return "\n".join(lines)
 
 def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
     if not bot_token or not chat_id:
@@ -636,7 +635,7 @@ cfg["ALLOWLIST_STRICT"] = bool(st.sidebar.checkbox("🧱 ALLOWLIST_STRICT (허�
 
 st.sidebar.divider()
 if st.sidebar.button("구성 리로드", use_container_width=True):
-    st.experimental_rerun()
+    st.rerun()
 
 st.title("📰 국내 PE 동향 뉴스 자동 모니터링")
 st.caption("Streamlit + Naver/NewsAPI + Telegram + APScheduler (Render + UptimeRobot)")
