@@ -466,6 +466,7 @@ def run_scheduler(minutes: int) -> None:
             time.sleep(interval * 60)
 
 def main():
+    global DEFAULT_CONFIG_PATH
     parser = argparse.ArgumentParser(description="국내 PE 동향 뉴스 모니터링 (Telegram)")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="설정 파일 경로 (기본: config.json)")
     group = parser.add_mutually_exclusive_group(required=True)
