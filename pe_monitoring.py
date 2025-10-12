@@ -96,6 +96,9 @@ def save_sent_cache(hashes: Set[str]) -> None:
     except Exception as e:
         log.warning("전송 캐시 저장 실패: %s", e)
 
+# -------------------------
+# 외부 API (Naver / NewsAPI)
+# -------------------------
 
 # ===== [NEW] Story Key & Enhanced Cache (v2) =====
 def story_key(item: dict) -> str:
@@ -167,9 +170,6 @@ def save_sent_cache_v2(url_map: dict, story_map: dict) -> None:
     except Exception as e:
         log.warning("전송 캐시 저장 실패(v2): %s", e)
 
-# -------------------------
-# 외부 API (Naver / NewsAPI)
-# -------------------------
 def search_naver_news(keyword: str, client_id: str, client_secret: str, recency_hours=72) -> List[dict]:
     if not client_id or not client_secret or not keyword:
         return []
@@ -434,6 +434,7 @@ def collect_all(cfg: dict, env: dict) -> List[dict]:
 
     return all_items
 
+
 def format_telegram_text(items: List[dict]) -> str:
     if not items:
         return "📭 신규 뉴스 없음"
@@ -441,14 +442,15 @@ def format_telegram_text(items: List[dict]) -> str:
     for it in items:
         t = it.get("title", "").strip()
         u = it.get("url", "")
+        src = domain_of(u)
         try:
             pub = dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).astimezone(APP_TZ)
             when = pub.strftime("%Y-%m-%d %H:%M")
         except Exception:
             when = "-"
-        # 제목=링크, 출처 도메인 미표시
-        lines.append(f"• <a href=\"{u}\">{t}</a> ({when})")
-    return "\n".join(lines)
+        lines.append(f"• <a href=\"{u}\">{t}</a> — {src} ({when})")
+    return "
+".join(lines)
 
 def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
     if not bot_token or not chat_id:
@@ -542,6 +544,10 @@ def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
     finally:
         run_lock.release()
 
+# -------------------------
+# 스케줄러 (rerun-safe)
+# -------------------------
+@st.cache_resource(show_spinner=False)
 def get_scheduler() -> BackgroundScheduler:
     sched = BackgroundScheduler(timezone=APP_TZ)
     sched.start()
@@ -565,8 +571,10 @@ def ensure_interval_job(sched: BackgroundScheduler, minutes: int):
     sched.add_job(scheduled_job, "interval", minutes=minutes, id=job_id,
                   replace_existing=True, next_run_time=now_kst())
 
-def is_running(sched: BackgroundScheduler) -> bool:
+
+def is_running(_: BackgroundScheduler = None) -> bool:
     try:
+        sched = get_scheduler()
         return any(j.id == "pe_news_job" for j in sched.get_jobs())
     except Exception:
         return False
@@ -655,20 +663,32 @@ with col2:
         res = transmit_once(cfg, make_env(), preview=False)
         st.session_state["preview"] = res
 
+
 with col3:
     if st.button("스케줄 시작"):
         start_schedule(cfg_path=cfg_path, cfg_dict=cfg, env=make_env(), minutes=int(cfg["INTERVAL_MIN"]))
         st.success("스케줄 시작됨 (즉시 1회 전송 후 주기 실행)")
+        st.rerun()
 
 with col4:
     if st.button("스케줄 중지"):
         stop_schedule()
         st.warning("스케줄 중지됨")
+        st.rerun()
+
 
 # 상태
-_running = is_running(sched)
+_running = is_running()
 st.subheader("상태")
+sched = get_scheduler()
+jobs = []
+try:
+    jobs = sched.get_jobs()
+except Exception:
+    jobs = []
 st.info(f"Scheduler 실행 중: {_running}")
+for j in jobs:
+    st.caption(f"• Job: {j.id} / 다음 실행: {j.next_run_time}")
 
 # 미리보기 결과 — 전체 필터링 기사만 표시 (Top10 없음)
 st.subheader("📋 필터링된 전체 기사")
