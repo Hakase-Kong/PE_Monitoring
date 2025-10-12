@@ -180,9 +180,55 @@
     "news.naver.com": 1.0,
     "n.news.naver.com": 1.0
   },
+  "STRICT_AMBIGUOUS_TOKENS": [
+    "매각",
+    "인수",
+    "M&A",
+    "거래",
+    "출자",
+    "투자"
+  ],
+  "CONTEXT_REQUIRE_ANY": [
+    "사모펀드",
+    "PE",
+    "PEF",
+    "프라이빗에쿼티",
+    "공개매수",
+    "경영권",
+    "지분 인수",
+    "본입찰",
+    "예비입찰",
+    "우선협상",
+    "바이아웃",
+    "컨티뉴에이션",
+    "리캡",
+    "리파이낸싱",
+    "PIPE",
+    "메자닌",
+    "GP",
+    "LP",
+    "MBK",
+    "IMM",
+    "VIG",
+    "KCGI",
+    "한앤컴퍼니",
+    "CVC",
+    "KKR",
+    "TPG",
+    "칼라일",
+    "EQT",
+    "블랙스톤"
+  ],
+  "EXCLUDE_TITLE_REGEX": [
+    "(상속세|물납|종부세|국세청)"
+  ],
   "RECENCY_HOURS": 72,
+  "CACHE_RETENTION_HOURS": 72,
   "ONLY_WORKING_HOURS": true,
+  "HOLIDAYS": [],
   "TELEGRAM_DISABLE_PREVIEW": true,
+  "SHOW_SOURCE_DOMAIN": false,
+  "NO_NEWS_SILENT": true,
   "MAX_PER_KEYWORD": 8,
   "PAGE_SIZE": 30,
   "INTERVAL_MIN": 60,
@@ -197,6 +243,5 @@
     "news.naver.com",
     "n.news.naver.com"
   ],
-  "NEWSAPI_QUERY": "(\"private equity\" OR 사모펀드 OR 바이아웃 OR 공개매수 OR \"M&A\" OR 인수 OR 매각)",
-  "HOLIDAYS": []
+  "NEWSAPI_QUERY": "(\"private equity\" OR 사모펀드 OR 바이아웃 OR 공개매수 OR \"M&A\" OR 인수 OR 매각)"
 }

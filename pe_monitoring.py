@@ -174,7 +174,7 @@ def search_naver_news(keyword: str, client_id: str, client_secret: str, recency_
     if not client_id or not client_secret or not keyword:
         return []
     base = "https://openapi.naver.com/v1/search/news.json"
-    params = {"query": keyword, "display": 30, "sort": "date"}
+    params = {"query": keyword, "display": clamp(int(cfg.get("PAGE_SIZE", 30)), 10, 100), "sort": "date"}
     headers = {
         "X-Naver-Client-Id": client_id,
         "X-Naver-Client-Secret": client_secret,
@@ -219,7 +219,7 @@ def search_newsapi(query: str, page_size: int, api_key: str, from_hours: int = 7
     params = {
         "q": (cfg.get("NEWSAPI_QUERY") if (cfg and cfg.get("NEWSAPI_QUERY")) else query),
         "searchIn": "title",
-        "pageSize": clamp(page_size, 10, 100),
+        "pageSize": clamp(int(cfg.get("PAGE_SIZE", 30)), 10, 100)(page_size, 10, 100),
         "language": "ko",
         "sortBy": "publishedAt",
         "from": from_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -435,7 +435,7 @@ def collect_all(cfg: dict, env: dict) -> List[dict]:
     return all_items
 
 
-def format_telegram_text(items: List[dict]) -> str:
+def format_telegram_text(items: List[dict], cfg: dict = GLOBAL_CFG if 'GLOBAL_CFG' in globals() else {}) -> str:
     if not items:
         return "📭 신규 뉴스 없음"
     lines = ["📌 <b>국내 PE 동향 관련 뉴스</b>"]
@@ -448,7 +448,7 @@ def format_telegram_text(items: List[dict]) -> str:
             when = pub.strftime("%Y-%m-%d %H:%M")
         except Exception:
             when = "-"
-        lines.append(f"• <a href=\"{u}\">{t}</a> — {src} ({when})")
+        lines.append(f"• <a href=\"{u}\">{t}</a> — {src} ({when})" if bool(cfg.get("SHOW_SOURCE_DOMAIN", False)) else f"• <a href=\"{u}\">{t}</a> ({when})")
     return "\n".join(lines)
 
 def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
@@ -705,3 +705,18 @@ else:
         except Exception:
             when = "-"
         st.markdown(f"- <a href='{u}'>{t}</a> ({when})", unsafe_allow_html=True)
+
+def should_drop(title: str, url: str, cfg: dict):
+    ambiguous = set(cfg.get("STRICT_AMBIGUOUS_TOKENS", []))
+    context   = set(cfg.get("CONTEXT_REQUIRE_ANY", []))
+    tl = (title or "").lower()
+    if any(tok.lower() in tl for tok in ambiguous):
+        if context and not any(ctx.lower() in tl for ctx in context):
+            return True
+    for rx in (cfg.get("EXCLUDE_TITLE_REGEX", []) or []):
+        try:
+            if re.search(rx, title or "", flags=re.I):
+                return True
+        except re.error:
+            pass
+    return False
