@@ -96,6 +96,77 @@ def save_sent_cache(hashes: Set[str]) -> None:
     except Exception as e:
         log.warning("전송 캐시 저장 실패: %s", e)
 
+
+# ===== [NEW] Story Key & Enhanced Cache (v2) =====
+def story_key(item: dict) -> str:
+    """
+    회차(시간) 간에도 동일 이슈를 1회만 전송하기 위한 키.
+    - Naver: naver:OID:AID
+    - 기타: normalize_title 기반
+    """
+    url = item.get("url", "")
+    cid = canonical_url_id(url)
+    if cid.startswith("naver:"):
+        return cid
+    norm_t = normalize_title(item.get("title", ""))
+    return f"title:{sha1(norm_t)}"
+
+def _utcnow_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _parse_iso(s: str) -> dt.datetime:
+    try:
+        return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        return dt.datetime.now(dt.timezone.utc)
+
+def load_sent_cache_v2(retention_hours: int = 72) -> (dict, dict):
+    """
+    캐시파일 구조(신규): {"url": {"<hash>": "iso"}, "story": {"<keyhash>":"iso"}}
+    구버전(list 또는 단순 list[str])도 호환.
+    반환: (url_dict, story_dict)
+    """
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        raw = {}
+
+    now = dt.datetime.now(dt.timezone.utc)
+    limit = now - dt.timedelta(hours=max(6, retention_hours))
+
+    url_map = {}
+    story_map = {}
+
+    # 구버전(list) 호환: URL 해시만 존재
+    if isinstance(raw, list):
+        for h in raw:
+            url_map[h] = _utcnow_iso()
+    elif isinstance(raw, dict):
+        url_map = dict(raw.get("url", {}))
+        story_map = dict(raw.get("story", {}))
+
+    # 만료 정리
+    def _prune(d: dict) -> dict:
+        out = {}
+        for k, ts in d.items():
+            try:
+                ts_dt = _parse_iso(ts)
+            except Exception:
+                continue
+            if ts_dt >= limit:
+                out[k] = ts
+        return out
+
+    return _prune(url_map), _prune(story_map)
+
+def save_sent_cache_v2(url_map: dict, story_map: dict) -> None:
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"url": url_map, "story": story_map}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("전송 캐시 저장 실패(v2): %s", e)
+
 # -------------------------
 # 외부 API (Naver / NewsAPI)
 # -------------------------
@@ -415,35 +486,43 @@ def _should_skip_by_time(cfg: dict) -> bool:
 def get_run_lock() -> Lock:
     return Lock()
 
+
 def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
-    # 실행 겹침 방지 (동시에 두 번 이상 돌지 않도록)
     run_lock = get_run_lock()
     if not run_lock.acquire(blocking=False):
         log.info("다른 실행이 진행 중이어서 이번 주기는 스킵합니다.")
         return {"count": 0, "items": []}
     try:
-        # 전체 수집 → 필터/정렬 → 전체 리스트
         all_items = collect_all(cfg, env)
         ranked = rank_filtered(all_items, cfg)
 
         if preview:
             return {"count": len(ranked), "items": ranked}
 
-        # 전송 타임 필터
         if _should_skip_by_time(cfg):
             log.info("시간 정책에 의해 전송 건너뜀 (업무시간/주말/공휴일)")
             return {"count": 0, "items": []}
 
-        # 신규만 전송 (캐시 기준)
-        cache = load_sent_cache()
-        new_items = [it for it in ranked if sha1(it.get("url", "")) not in cache]
+        retention = int(cfg.get("CACHE_RETENTION_HOURS", cfg.get("RECENCY_HOURS", 72)))
+        url_cache, story_cache = load_sent_cache_v2(retention_hours=retention)
+        now_iso = _utcnow_iso()
 
-        # 신규 없으면 알림
+        new_items = []
+        for it in ranked:
+            uhash = sha1(it.get("url", ""))
+            skey  = story_key(it)
+            if (uhash in url_cache) or (skey in story_cache):
+                continue
+            new_items.append(it)
+
         if not new_items:
-            send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), "📭 신규 뉴스 없음")
-            return {"count": 0, "items": []}
+            if bool(cfg.get("NO_NEWS_SILENT", True)):
+                log.info("신규 뉴스 없음 (무소식 알림 억제 옵션으로 미전송)")
+                return {"count": 0, "items": []}
+            else:
+                send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), "📭 신규 뉴스 없음")
+                return {"count": 0, "items": []}
 
-        # 텔레그램 4096자 제한 대비 — 30개 단위로 배치 전송
         BATCH = 30
         sent_any = False
         for i in range(0, len(new_items), BATCH):
@@ -454,17 +533,15 @@ def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
             time.sleep(0.6)
 
         if sent_any:
-            cache |= {sha1(it.get("url", "")) for it in new_items}
-            save_sent_cache(cache)
+            for it in new_items:
+                url_cache[sha1(it.get("url", ""))] = now_iso
+                story_cache[story_key(it)] = now_iso
+            save_sent_cache_v2(url_cache, story_cache)
 
         return {"count": len(new_items), "items": new_items}
     finally:
         run_lock.release()
 
-# -------------------------
-# 스케줄러 (rerun-safe)
-# -------------------------
-@st.cache_resource(show_spinner=False)
 def get_scheduler() -> BackgroundScheduler:
     sched = BackgroundScheduler(timezone=APP_TZ)
     sched.start()
