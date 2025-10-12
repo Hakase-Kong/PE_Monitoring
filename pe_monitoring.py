@@ -434,7 +434,7 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
     cfg.setdefault("use_newsapi", True)
     return cfg
 
-def _env() -> Dict[str, str]:
+def _env(config_path: Optional[str] = None) -> Dict[str, str]:
     # 환경변수 + config.json의 telegram, newsapi 설정 병합
     env = {
         "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
@@ -442,7 +442,7 @@ def _env() -> Dict[str, str]:
         "NEWSAPI_KEY": os.environ.get("NEWSAPI_KEY", ""),
     }
     # config.json에 별도 지정이 있으면 보강
-    cfg = load_config()
+    cfg = load_config(config_path or DEFAULT_CONFIG_PATH)
     t = cfg.get("telegram", {})
     if t:
         env["TELEGRAM_BOT_TOKEN"] = env["TELEGRAM_BOT_TOKEN"] or t.get("bot_token", "")
@@ -452,8 +452,8 @@ def _env() -> Dict[str, str]:
         env["NEWSAPI_KEY"] = env["NEWSAPI_KEY"] or n.get("api_key", "")
     return env
 
-def run_scheduler(minutes: int) -> None:
-    cfg = load_config()
+def run_scheduler(minutes: int, config_path: Optional[str] = None) -> None:
+    cfg = load_config(config_path or DEFAULT_CONFIG_PATH)
     env = _env()
     interval = max(5, int(minutes))  # 최소 5분
     log.info("스케줄 시작: %d분 간격", interval)
@@ -466,7 +466,6 @@ def run_scheduler(minutes: int) -> None:
             time.sleep(interval * 60)
 
 def main():
-    global DEFAULT_CONFIG_PATH
     parser = argparse.ArgumentParser(description="국내 PE 동향 뉴스 모니터링 (Telegram)")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="설정 파일 경로 (기본: config.json)")
     group = parser.add_mutually_exclusive_group(required=True)
@@ -482,16 +481,15 @@ def main():
     )
 
     # 설정 로드
-    global DEFAULT_CONFIG_PATH
-    DEFAULT_CONFIG_PATH = args.config
-    cfg = load_config(DEFAULT_CONFIG_PATH)
-    env = _env()
+    config_path = args.config
+    cfg = load_config(config_path)
+    env = _env(config_path)
 
     if args.once:
         res = transmit_once(cfg, env)
         log.info("전송 결과: %s", res.get("count"))
     else:
-        run_scheduler(args.schedule_minutes)
+        run_scheduler(args.schedule_minutes, config_path)
 
 if __name__ == "__main__":
     main()
