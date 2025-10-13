@@ -438,7 +438,7 @@ def should_drop(item: dict, cfg: dict) -> bool:
 
     has_context = any(k.lower() in context for k in context_any)
 
-    trusted = set(cfg.get("TRUSTED_SOURES_FOR_FI", cfg.get("ALLOW_DOMAINS", [])) or [])
+    trusted = set(cfg.get("TRUSTED_SOURCES_FOR_FI", cfg.get("ALLOW_DOMAINS", [])) or [])
     amb_tokens = set(t.lower() for t in (cfg.get("STRICT_AMBIGUOUS_TOKENS", []) or []))
     has_ambiguous = any(tok in title.lower() for tok in amb_tokens)
 
