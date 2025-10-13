@@ -383,7 +383,7 @@ def should_drop(item: dict, cfg: dict) -> bool:
     if allow_strict and allow and (src not in allow):
         return True
 
-    # 네이버 섹션 제한(예: 경제면=101)
+    # 네이버 섹션 제한
     if "naver.com" in src:
         sids = set(cfg.get("NAVER_ALLOW_SIDS", []) or [])
         if sids:
@@ -399,12 +399,24 @@ def should_drop(item: dict, cfg: dict) -> bool:
         if w and w.lower() in title.lower():
             return True
 
-    # ✅ 추가: PEF 맥락 필수 조건
-    context_any = cfg.get("CONTEXT_REQUIRE_ANY", [])
+    # -------------------------------
+    # 🔽 여기부터 수정/추가 부분
+    # -------------------------------
+    # PEF 맥락 필수 조건을 기본 적용하되,
+    # '신뢰 도메인 + 모호하지만 중요한 토큰(매각/공개매각/인수 등)'이면 LLM으로 넘기도록 우회 허용
+    context_any = cfg.get("CONTEXT_REQUIRE_ANY", []) or []
     context = (title + " " + item.get("description", "")).lower()
-    if not any(k.lower() in context for k in context_any):
-        # 사모펀드/PE 관련 단어가 전혀 없으면 제외
-        return True
+
+    has_context = any(k.lower() in context for k in context_any)
+
+    trusted = set(cfg.get("TRUSTED_SOURCES_FOR_FI", cfg.get("ALLOW_DOMAINS", [])) or [])
+    amb_tokens = set(t.lower() for t in (cfg.get("STRICT_AMBIGUOUS_TOKENS", []) or []))
+    has_ambiguous = any(tok in title.lower() for tok in amb_tokens)
+
+    # 맥락 단어가 없다면 → (신뢰 도메인 AND 모호토큰)일 때만 통과시켜 LLM에서 판단
+    if not has_context:
+        if not (src in trusted and has_ambiguous):
+            return True
 
     return False
 
@@ -444,29 +456,30 @@ def _llm_prompt_for_item(item: dict, cfg: dict) -> str:
     firms = cfg.get("FIRM_WATCHLIST", []) or []
     context_any = cfg.get("CONTEXT_REQUIRE_ANY", []) or []
     return f"""
-    당신은 '국내 PE 동향' 관련 기사를 분류하는 전문가입니다.
-    다음 기사가 사모펀드(PEF), GP/LP, 재무적투자자(FI)의 투자·인수·매각·자금회수·리파이낸싱 활동과 직접적으로 관련이 있는지 판별하세요.
-    단순 산업 내 일반 M&A(전략적 인수·경영권 변동 등)는 제외합니다.
-    
-    판단 기준:
-    - 핵심 키워드: {', '.join(kw)}
-    - 동의어: {', '.join(aliases)}
-    - 운용사/FI 워치리스트: {', '.join(firms)}
-    - 맥락 키워드(있으면 강한 근거): {', '.join(context_any)}
-    
-    출력은 반드시 JSON 한 줄:
-    {{
-      "relevant": true|false,
-      "confidence": 0.0~1.0,
-      "category": "PE deal"|"industry M&A"|"finance general"|"irrelevant",
-      "reason": "한 줄 근거"
-    }}
-    
-    기사:
-    - 제목: {item.get('title','')}
-    - 출처: {domain_of(item.get('url',''))}
-    - 링크: {item.get('url','')}
-    """
+당신은 '국내 PE 동향' 관련 기사를 분류하는 전문가입니다.
+다음 기사가 사모펀드(PEF), GP/LP, 재무적 투자자(FI)의 투자·인수·매각·리파이낸싱 활동과 관련이 있거나,
+그들이 관여할 가능성이 높은 거래(M&A, 매각, 대형 자금조달, 공개매수)인지 판단하세요.
+단순 산업 내 전략적 인수나 일반 기업 인사·운영 보도는 제외합니다.
+
+판단 기준:
+- 핵심 키워드: {', '.join(kw)}
+- 동의어: {', '.join(aliases)}
+- 운용사/FI 워치리스트: {', '.join(firms)}
+- 맥락 키워드(있으면 강한 근거): {', '.join(context_any)}
+
+출력은 반드시 JSON 한 줄로 반환:
+{{
+  "relevant": true|false,
+  "confidence": 0.0~1.0,
+  "category": "PE deal"|"finance general"|"industry M&A"|"irrelevant",
+  "reason": "한 줄 근거"
+}}
+
+기사:
+- 제목: {item.get('title','')}
+- 출처: {domain_of(item.get('url',''))}
+- 링크: {item.get('url','')}
+"""
 
 def _openai_chat(messages: List[Dict], api_key: str, model: str, max_tokens: int = 300, temperature: float = 0.0) -> str:
     url = "https://api.openai.com/v1/chat/completions"
@@ -489,17 +502,17 @@ def llm_filter_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
         return items
 
     model = cfg.get("LLM_MODEL", "gpt-4o-mini")
-    conf_th = float(cfg.get("LLM_CONF_THRESHOLD", 0.8))  # ✅ 상향
+    conf_th = float(cfg.get("LLM_CONF_THRESHOLD", 0.7))  # ✅ 완화
     out = []
 
     for it in items:
         try:
             user_prompt = _llm_prompt_for_item(it, cfg)
             messages = [
-                {"role": "system", "content": "You are a strict classifier for Private Equity (KR). Return JSON only."},
+                {"role": "system", "content": "You are a professional financial news classifier for Private Equity (KR). Return JSON only."},
                 {"role": "user", "content": user_prompt},
             ]
-            resp = _openai_chat(messages, api_key, model, max_tokens=int(cfg.get("LLM_MAX_TOKENS", 300)))
+            resp = _openai_chat(messages, api_key, model, max_tokens=int(cfg.get("LLM_MAX_TOKENS", 400)))
             j = None
             try:
                 j = json.loads(resp.strip())
@@ -509,12 +522,13 @@ def llm_filter_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
                 if m:
                     j = json.loads(m.group(0))
 
-            # ✅ category와 confidence 기반 필터링
+            # ✅ 완화된 조건: PE deal or finance general 둘 다 허용
+            cat = (j or {}).get("category", "").lower()
             if (
                 isinstance(j, dict)
                 and j.get("relevant") is True
-                and j.get("category", "").lower() == "pe deal"
                 and float(j.get("confidence", 0.0)) >= conf_th
+                and cat in {"pe deal", "finance general"}
             ):
                 it["_llm"] = j
                 out.append(it)
