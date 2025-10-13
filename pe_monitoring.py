@@ -383,7 +383,7 @@ def should_drop(item: dict, cfg: dict) -> bool:
     if allow_strict and allow and (src not in allow):
         return True
 
-    # 네이버 섹션 제한(예: 경제면=101)
+    # 네이버 섹션 제한
     if "naver.com" in src:
         sids = set(cfg.get("NAVER_ALLOW_SIDS", []) or [])
         if sids:
@@ -399,12 +399,24 @@ def should_drop(item: dict, cfg: dict) -> bool:
         if w and w.lower() in title.lower():
             return True
 
-    # ✅ 추가: PEF 맥락 필수 조건
-    context_any = cfg.get("CONTEXT_REQUIRE_ANY", [])
+    # -------------------------------
+    # 🔽 여기부터 수정/추가 부분
+    # -------------------------------
+    # PEF 맥락 필수 조건을 기본 적용하되,
+    # '신뢰 도메인 + 모호하지만 중요한 토큰(매각/공개매각/인수 등)'이면 LLM으로 넘기도록 우회 허용
+    context_any = cfg.get("CONTEXT_REQUIRE_ANY", []) or []
     context = (title + " " + item.get("description", "")).lower()
-    if not any(k.lower() in context for k in context_any):
-        # 사모펀드/PE 관련 단어가 전혀 없으면 제외
-        return True
+
+    has_context = any(k.lower() in context for k in context_any)
+
+    trusted = set(cfg.get("TRUSTED_SOURCES_FOR_FI", cfg.get("ALLOW_DOMAINS", [])) or [])
+    amb_tokens = set(t.lower() for t in (cfg.get("STRICT_AMBIGUOUS_TOKENS", []) or []))
+    has_ambiguous = any(tok in title.lower() for tok in amb_tokens)
+
+    # 맥락 단어가 없다면 → (신뢰 도메인 AND 모호토큰)일 때만 통과시켜 LLM에서 판단
+    if not has_context:
+        if not (src in trusted and has_ambiguous):
+            return True
 
     return False
 

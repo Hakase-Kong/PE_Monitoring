@@ -180,14 +180,8 @@
     "news.naver.com": 1.0,
     "n.news.naver.com": 1.0
   },
-  "STRICT_AMBIGUOUS_TOKENS": [
-    "매각",
-    "인수",
-    "M&A",
-    "거래",
-    "출자",
-    "투자"
-  ],
+  "STRICT_AMBIGUOUS_TOKENS": ["매각", "공개매각", "인수", "M&A", "딜", "본입찰", "예비입찰"],
+  "TRUSTED_SOURCES_FOR_FI": ["www.thebell.co.kr", "www.investchosun.com", "dealsite.co.kr", "news.naver.com", "n.news.naver.com"],
   "CONTEXT_REQUIRE_ANY": [
     "사모펀드",
     "PE",
