@@ -438,7 +438,7 @@ def should_drop(item: dict, cfg: dict) -> bool:
 
     has_context = any(k.lower() in context for k in context_any)
 
-    trusted = set(cfg.get("TRUSTED_SOURES_FOR_FI", cfg.get("ALLOW_DOMAINS", [])) or [])
+    trusted = set(cfg.get("TRUSTED_SOURCES_FOR_FI", cfg.get("ALLOW_DOMAINS", [])) or [])
     amb_tokens = set(t.lower() for t in (cfg.get("STRICT_AMBIGUOUS_TOKENS", []) or []))
     has_ambiguous = any(tok in title.lower() for tok in amb_tokens)
 
@@ -539,7 +539,13 @@ def llm_filter_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
         try:
             user_prompt = _llm_prompt_for_item(it, cfg)
             messages = [
-                {"role": "system", "content": "You are a professional financial news classifier for Private Equity (KR). Return JSON only."},
+                {"role": "system", "content":
+                    "You are a professional news classifier for Private Equity (KR). "
+                    "Classify only deals/events where a financial investor (PEF/GP/LP, co-invest, secondary, structured/NAV/pref-equity, PIPE, mezzanine, recap/refi) "
+                    "is involved or is plausibly involved. "
+                    "If a strategic investor (SI) conducts a pure industry M&A without FI involvement, mark relevant=false (category='industry M&A'). "
+                    "Return JSON only."
+                },
                 {"role": "user", "content": user_prompt},
             ]
             resp = _openai_chat(messages, api_key, model, max_tokens=int(cfg.get("LLM_MAX_TOKENS", 400)))
@@ -799,7 +805,7 @@ cfg["ALLOWLIST_STRICT"] = bool(st.sidebar.checkbox("🧱 ALLOWLIST_STRICT (허�
 st.sidebar.subheader("LLM 필터(선택)")
 cfg["USE_LLM_FILTER"] = bool(st.sidebar.checkbox("🤖 OpenAI로 2차 필터링", value=bool(cfg.get("USE_LLM_FILTER", False))))
 cfg["LLM_MODEL"] = st.sidebar.text_input("모델", value=cfg.get("LLM_MODEL", "gpt-4o-mini"))
-cfg["LLM_CONF_THRESHOLD"] = float(st.sidebar.slider("채택 임계치(신뢰도)", min_value=0.0, max_value=1.0, value=float(cfg.get("LLM_CONF_THRESHOLD", 0.55)), step=0.05))
+cfg["LLM_CONF_THRESHOLD"] = float(st.sidebar.slider("채택 임계치(신뢰도)", min_value=0.0, max_value=1.0, value=float(cfg.get("LLM_CONF_THRESHOLD", 0.7)), step=0.05))
 cfg["LLM_MAX_TOKENS"] = int(st.sidebar.number_input("max_tokens", min_value=64, max_value=1000, step=10, value=int(cfg.get("LLM_MAX_TOKENS", 300))))
 
 st.sidebar.divider()

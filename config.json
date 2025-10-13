@@ -21,7 +21,12 @@
     "블라인드펀드",
     "Growth Capital",
     "PIPE",
-    "메자닌"
+    "메자닌",
+    "카브아웃", "carve-out", "스핀오프", "spin-off",
+    "컨티뉴에이션 펀드", "continuation fund", "세컨더리", "secondary",
+    "NAV 파이낸싱", "preferred equity", "structured equity",
+    "브릿지론", "RCF", "DIP", "PIK",
+    "유동화", "ABL", "셀사이드", "바이사이드"
   ],
   "KEYWORD_ALIASES": {
     "바이아웃": [
@@ -85,7 +90,21 @@
       "교환사채",
       "CB",
       "EB"
-    ]
+    ],
+    "카브아웃": ["carve-out", "분할매각", "사업부 매각"],
+    "스핀오프": ["spin-off", "분할 신설", "물적분할", "인적분할"],
+    "컨티뉴에이션 펀드": ["continuation fund", "컨티뉴에이션", "연속 펀드"],
+    "세컨더리": ["secondary", "GP主導 세컨더리", "LP 지분매각", "지분세컨더리"],
+    "NAV 파이낸싱": ["NAV financing", "NAV 파이낸스"],
+    "preferred equity": ["pref equity", "우선주 투자", "프리퍼드 에쿼티"],
+    "structured equity": ["구조화 에쿼티", "구조화 투자"],
+    "브릿지론": ["bridge loan", "브릿지 파이낸싱"],
+    "RCF": ["revolving credit facility", "한도대출"],
+    "DIP": ["DIP financing", "법정관리 인수금융"],
+    "PIK": ["PIK toggle", "지급유예 이자"],
+    "ABL": ["자산유동화대출", "accounts receivable loan"],
+    "셀사이드": ["sell-side", "매각자 측"],
+    "바이사이드": ["buy-side", "인수자 측"]
   },
   "FIRM_WATCHLIST": [
     "MBK",
@@ -211,7 +230,10 @@
     "TPG",
     "칼라일",
     "EQT",
-    "블랙스톤"
+    "블랙스톤",
+    "재무자문", "법률자문", "주관사",
+    "세일즈사이드", "바이사이드",
+    "베인", "피치북", "리피니티브", "리서치 보고서"
   ],
   "EXCLUDE_TITLE_REGEX": [
     "(상속세|물납|종부세|국세청)"
@@ -237,7 +259,8 @@
     "news.naver.com",
     "n.news.naver.com"
   ],
-  "NEWSAPI_QUERY": "(\\\"private equity\\\" OR 사모펀드 OR 바이아웃 OR 공개매수 OR \\\"M&A\\\" OR 인수 OR 매각)",
+  "(\\\"private equity\\\" OR 사모펀드 OR 바이아웃 OR 공개매수 OR \\\"M&A\\\" OR 인수 OR 매각 \
+  + OR carve-out OR spin-off OR \\\"continuation fund\\\" OR secondary OR \\\"preferred equity\\\" OR \\\"structured equity\\\")",
   "USE_LLM_FILTER": true,
   "LLM_MODEL": "gpt-4o-mini",
   "LLM_CONF_THRESHOLD": 0.7,
