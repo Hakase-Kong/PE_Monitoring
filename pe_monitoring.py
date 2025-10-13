@@ -388,6 +388,27 @@ def topic_signature(item: dict, cfg: dict) -> str:
         return f"host:{domain_of(item.get('url',''))}"
     return "|".join(toks)
 
+RARE_STOPWORDS = {
+    "매각","인수","거래","m&a","시장","기업","국내","해외","자금","투자","우협",
+    "본입찰","예비입찰","분석","해설","전망","이슈","단독","속보","시그널","투자360",
+    "영상","포토","르포","사설","칼럼","인터뷰","특집","집중","종합","마켓인","리뷰","현장"
+}
+def _rare_tokens_for_dedup(title: str, cfg: dict) -> set:
+    """중복판정용 희귀 토큰: 숫자/일반어 제거 + 워치리스트/모호토큰 가중."""
+    base = normalize_title(title)
+    base = re.sub(r"\b\d{1,4}(?:\.\d+)?\b", " ", base)
+    toks = [w for w in re.split(r"[^0-9a-zA-Z가-힣]+", base) if len(w) >= 2]
+    keep = set(toks) - RARE_STOPWORDS
+    # 사모펀드 운용사/자산명 등은 보존
+    for w in (cfg.get("FIRM_WATCHLIST", []) or []) + (cfg.get("STRICT_AMBIGUOUS_TOKENS", []) or []):
+        if w and w.lower() in base:
+            keep.add(w.lower())
+    # 너무 흔한 일반어 삭제
+    for w in ["공개매각","승부수","분수령","완료","추진","선정","기대","전환","발표","논란"]:
+        keep.discard(w.lower())
+    # 상위 소수만
+    return set(list(keep)[:8])
+
 def dedup(items: List[dict]) -> List[dict]:
     """
     중복 제거 우선순위 (점수 높은 기사 우선 채택):
@@ -453,11 +474,11 @@ def dedup(items: List[dict]) -> List[dict]:
 
         # E) (옵션) LLM matched 토큰 교집합
         try:
-            m = set((it.get("_llm") or {}).get("matched") or [])
-            if m:
+            cur_rare = _rare_tokens_for_dedup(it.get("title",""), cfg)
+            if cur_rare:
                 for s in out:
-                    m2 = set((s.get("_llm") or {}).get("matched") or [])
-                    if m2 and len(m & m2) >= llm_m_inter:
+                    prev_rare = _rare_tokens_for_dedup(s.get("title",""), cfg)
+                    if prev_rare and len(cur_rare & prev_rare) >= 1:
                         dup = True; break
                 if dup:
                     continue
