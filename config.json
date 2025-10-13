@@ -180,8 +180,14 @@
     "news.naver.com": 1.0,
     "n.news.naver.com": 1.0
   },
-  "STRICT_AMBIGUOUS_TOKENS": ["매각", "공개매각", "인수", "M&A", "딜", "본입찰", "예비입찰"],
-  "TRUSTED_SOURCES_FOR_FI": ["www.thebell.co.kr", "www.investchosun.com", "dealsite.co.kr", "news.naver.com", "n.news.naver.com"],
+  "STRICT_AMBIGUOUS_TOKENS": [
+    "매각",
+    "인수",
+    "M&A",
+    "거래",
+    "출자",
+    "투자"
+  ],
   "CONTEXT_REQUIRE_ANY": [
     "사모펀드",
     "PE",
@@ -240,11 +246,6 @@
   "NEWSAPI_QUERY": "(\\\"private equity\\\" OR 사모펀드 OR 바이아웃 OR 공개매수 OR \\\"M&A\\\" OR 인수 OR 매각)",
   "USE_LLM_FILTER": true,
   "LLM_MODEL": "gpt-4o-mini",
-  "LLM_CONF_THRESHOLD": 0.7,
-  "LLM_MAX_TOKENS": 400,
-  "DEDUP_SAME_HOST_HOURS": 36,
-  "DEDUP_SIG_HOURS": 36,
-  "DEDUP_SIM_HOST": 0.60,
-  "DEDUP_SIM_XHOST": 0.70,
-  "DEDUP_LLM_MATCH_INTERSECT": 2
+  "LLM_CONF_THRESHOLD": 0.8,
+  "LLM_MAX_TOKENS": 400
 }

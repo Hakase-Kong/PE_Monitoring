@@ -343,154 +343,25 @@ def is_near_dup(a: str, b: str, time_a=None, time_b=None, src_a=None, src_b=None
         pass
     return False
 
-def _jaccard_bigrams(s: str) -> float:
-    a = _bigrams(s); 
-    return 0.0 if not a else len(a)
-
-def _sim_norm_title(a: str, b: str) -> float:
-    # 토큰/바이그램 혼합 유사도 (0~1)
-    ta, tb = _tokens(a), _tokens(b)
-    ja = len(ta & tb) / max(1, len(ta | tb)) if ta and tb else 0.0
-    ba, bb = _bigrams(a), _bigrams(b)
-    jb = len(ba & bb) / max(1, len(ba | bb)) if ba and bb else 0.0
-    # 토큰 0.6, 바이그램 0.4 가중
-    return 0.6 * ja + 0.4 * jb
-
-GENERIC_WORDS = {
-    "분석","해설","전망","이슈","단독","속보","시그널","fn마켓워치","투자360",
-    "영상","포토","르포","사설","칼럼","인터뷰","특집","집중","종합","마켓인","리뷰","현장"
-}
-
-def _signature_tokens(t: str, cfg: dict) -> List[str]:
-    """제목에서 사건을 대표할 토큰만 추출(숫자/일반어 제거, 고유명사 가중)."""
-    base = normalize_title(t)
-    base = re.sub(r"\b\d{1,4}(?:\.\d+)?\b", " ", base)  # 숫자/금액 제거
-    toks = [w for w in re.split(r"[^0-9a-zA-Z가-힣]+", base) if len(w) >= 2]
-
-    keep = set(toks) - GENERIC_WORDS
-    wl = [w.lower() for w in (cfg.get("FIRM_WATCHLIST", []) or [])]
-    amb = [w.lower() for w in (cfg.get("STRICT_AMBIGUOUS_TOKENS", []) or [])]
-    for w in wl + amb:
-        if w in base:
-            keep.add(w)
-
-    # 너무 일반적인 단어 제거
-    for w in ["매각","인수","거래","m&a","시장","기업","국내","해외","자금","투자","우협","본입찰","예비입찰"]:
-        keep.discard(w)
-
-    out = sorted(keep)
-    return out[:8]  # 대표 토큰 상위만
-
-def topic_signature(item: dict, cfg: dict) -> str:
-    """같은 이슈 묶음을 위한 시그니처 문자열."""
-    toks = _signature_tokens(item.get("title",""), cfg)
-    if not toks:
-        return f"host:{domain_of(item.get('url',''))}"
-    return "|".join(toks)
-
-RARE_STOPWORDS = {
-    "매각","인수","거래","m&a","시장","기업","국내","해외","자금","투자","우협",
-    "본입찰","예비입찰","분석","해설","전망","이슈","단독","속보","시그널","투자360",
-    "영상","포토","르포","사설","칼럼","인터뷰","특집","집중","종합","마켓인","리뷰","현장"
-}
-def _rare_tokens_for_dedup(title: str, cfg: dict) -> set:
-    """중복판정용 희귀 토큰: 숫자/일반어 제거 + 워치리스트/모호토큰 가중."""
-    base = normalize_title(title)
-    base = re.sub(r"\b\d{1,4}(?:\.\d+)?\b", " ", base)
-    toks = [w for w in re.split(r"[^0-9a-zA-Z가-힣]+", base) if len(w) >= 2]
-    keep = set(toks) - RARE_STOPWORDS
-    # 사모펀드 운용사/자산명 등은 보존
-    for w in (cfg.get("FIRM_WATCHLIST", []) or []) + (cfg.get("STRICT_AMBIGUOUS_TOKENS", []) or []):
-        if w and w.lower() in base:
-            keep.add(w.lower())
-    # 너무 흔한 일반어 삭제
-    for w in ["공개매각","승부수","분수령","완료","추진","선정","기대","전환","발표","논란"]:
-        keep.discard(w.lower())
-    # 상위 소수만
-    return set(list(keep)[:8])
-
 def dedup(items: List[dict]) -> List[dict]:
-    """
-    중복 제거 우선순위 (점수 높은 기사 우선 채택):
-      A) canonical_url_id 일치 → 중복
-      B) 동일 출처 & 시간창 내 & 제목유사도(호스트 기준) ≥ cfg.DEDUP_SIM_HOST → 중복
-      C) 서로 다른 출처더라도 제목유사도(크로스 호스트) ≥ cfg.DEDUP_SIM_XHOST → 중복
-      D) 이슈 시그니처 동일 & 시간창 내 → 중복
-      E) (옵션) LLM matched 토큰 교집합 크기 ≥ cfg.DEDUP_LLM_MATCH_INTERSECT → 중복
-    """
-    def _ts_kst(it):
-        try:
-            return dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).astimezone(APP_TZ)
-        except Exception:
-            return now_kst()
-
-    # 임계값 로드(없으면 기본값)
-    host_hours  = int(cfg.get("DEDUP_SAME_HOST_HOURS", 24))
-    sig_hours   = int(cfg.get("DEDUP_SIG_HOURS", 36))
-    sim_host    = float(cfg.get("DEDUP_SIM_HOST", 0.58))
-    sim_xhost   = float(cfg.get("DEDUP_SIM_XHOST", 0.72))
-    llm_m_inter = int(cfg.get("DEDUP_LLM_MATCH_INTERSECT", 2))
-
-    # 점수 높은 순
-    work = sorted(items, key=lambda x: x.get("_score", 0.0), reverse=True)
-
-    out: List[dict] = []
-    seen_titles: List[Dict] = []            # {t_norm, src, ts}
-    seen_by_urlid: Set[str] = set()
-    sig_index: Dict[str, dt.datetime] = {}  # signature -> ts
-
-    for it in work:
-        url  = it.get("url","")
-        src  = domain_of(url)
-        ts   = _ts_kst(it)
-        cid  = canonical_url_id(url)
-        tnorm= normalize_title(it.get("title",""))
-        sig  = topic_signature(it, cfg)
-
-        # A) URL 정규화 키
-        if cid in seen_by_urlid:
+    """URL 정규화 → 제목 근사 중복 제거 2단계."""
+    out, seen_by_id, seen_titles = [], set(), []
+    for it in items:
+        url = it.get("url", "")
+        cid = canonical_url_id(url)
+        if cid in seen_by_id:
             continue
-
-        # B/C) 제목 유사도 기반
+        norm_t = normalize_title(it.get("title", ""))
         dup = False
-        for s in seen_titles:
-            dt_hours = abs((ts - s["ts"]).total_seconds())/3600.0
-            sim = _sim_norm_title(tnorm, s["t_norm"])
-
-            # 동일 출처: 좁은 창 + 낮은 임계치
-            if s["src"] == src and dt_hours <= host_hours and sim >= sim_host:
-                dup = True; break
-
-            # 출처 달라도 거의 동일: 높은 임계치
-            if sim >= sim_xhost:
-                dup = True; break
+        for prev_norm, _idx in seen_titles:
+            if is_near_dup(norm_t, prev_norm):
+                dup = True
+                break
         if dup:
             continue
-
-        # D) 이슈 시그니처
-        prev_ts = sig_index.get(sig)
-        if prev_ts and abs((ts - prev_ts).total_seconds())/3600.0 <= sig_hours:
-            continue
-
-        # E) (옵션) LLM matched 토큰 교집합
-        try:
-            cur_rare = _rare_tokens_for_dedup(it.get("title",""), cfg)
-            if cur_rare:
-                for s in out:
-                    prev_rare = _rare_tokens_for_dedup(s.get("title",""), cfg)
-                    if prev_rare and len(cur_rare & prev_rare) >= 1:
-                        dup = True; break
-                if dup:
-                    continue
-        except Exception:
-            pass
-
-        # 채택
+        seen_by_id.add(cid)
+        seen_titles.append((norm_t, len(out)))
         out.append(it)
-        seen_by_urlid.add(cid)
-        seen_titles.append({"t_norm": tnorm, "src": src, "ts": ts})
-        sig_index[sig] = ts
-
     return out
 
 # -------------------------
@@ -512,7 +383,7 @@ def should_drop(item: dict, cfg: dict) -> bool:
     if allow_strict and allow and (src not in allow):
         return True
 
-    # Naver 섹션 제한
+    # 네이버 섹션 제한(예: 경제면=101)
     if "naver.com" in src:
         sids = set(cfg.get("NAVER_ALLOW_SIDS", []) or [])
         if sids:
@@ -520,30 +391,21 @@ def should_drop(item: dict, cfg: dict) -> bool:
             if sid not in sids:
                 return True
 
-    # ---------- 여기부터 변경 ----------
-    # 신뢰 도메인 & 모호 토큰(매각/공개매각/인수 등) 판단
-    trusted = set(cfg.get("TRUSTED_SOURCES_FOR_FI", cfg.get("ALLOW_DOMAINS", [])) or [])
-    amb_tokens = set(t.lower() for t in (cfg.get("STRICT_AMBIGUOUS_TOKENS", []) or []))
-    has_ambiguous = any(tok in title.lower() for tok in amb_tokens)
-    trusted_amb = (src in trusted) and has_ambiguous
-
     # 제목 포함/제외 키워드
     include = (cfg.get("INCLUDE_TITLE_KEYWORDS", []) or [])
     if include and not any(w.lower() in title.lower() for w in include):
-        # ⬇️ 포함 키워드가 없어도 '신뢰 도메인+모호 토큰'이면 LLM으로 넘긴다
-        if not trusted_amb:
-            return True
+        return True
     for w in (cfg.get("EXCLUDE_TITLE_KEYWORDS", []) or []):
         if w and w.lower() in title.lower():
             return True
 
-    # PEF 맥락 단어(사모펀드/PEF/GP/LP 등) 없으면 → 역시 '신뢰 도메인+모호 토큰'이면 통과
-    context_any = cfg.get("CONTEXT_REQUIRE_ANY", []) or []
+    # ✅ 추가: PEF 맥락 필수 조건
+    context_any = cfg.get("CONTEXT_REQUIRE_ANY", [])
     context = (title + " " + item.get("description", "")).lower()
-    has_context = any(k.lower() in context for k in context_any)
-    if not has_context and not trusted_amb:
+    if not any(k.lower() in context for k in context_any):
+        # 사모펀드/PE 관련 단어가 전혀 없으면 제외
         return True
-    # ---------- 변경 끝 ----------
+
     return False
 
 def score_item(item: dict, cfg: dict) -> float:
@@ -582,31 +444,29 @@ def _llm_prompt_for_item(item: dict, cfg: dict) -> str:
     firms = cfg.get("FIRM_WATCHLIST", []) or []
     context_any = cfg.get("CONTEXT_REQUIRE_ANY", []) or []
     return f"""
-당신은 '국내 PE 동향' 관련 기사를 분류하는 전문가입니다.
-다음 기사가 사모펀드(PEF), GP/LP, 재무적 투자자(FI)의 투자·인수·매각·리파이낸싱 활동과 관련이 있거나,
-그들이 관여할 가능성이 높은 거래(M&A, 매각, 대형 자금조달, 공개매수)인지 판단하세요.
-단순 산업 내 전략적 인수나 일반 기업 인사·운영 보도는 제외합니다.
-
-판단 기준:
-- 핵심 키워드: {', '.join(kw)}
-- 동의어: {', '.join(aliases)}
-- 운용사/FI 워치리스트: {', '.join(firms)}
-- 맥락 키워드(있으면 강한 근거): {', '.join(context_any)}
-
-출력은 반드시 JSON 한 줄로 반환:
-{{
-  "relevant": true|false,
-  "confidence": 0.0~1.0,
-  "category": "PE deal"|"finance general"|"industry M&A"|"irrelevant",
-  "matched": ["매칭된 단어들"],
-  "reason": "한 줄 근거"
-}}
-
-기사:
-- 제목: {item.get('title','')}
-- 출처: {domain_of(item.get('url',''))}
-- 링크: {item.get('url','')}
-"""
+    당신은 '국내 PE 동향' 관련 기사를 분류하는 전문가입니다.
+    다음 기사가 사모펀드(PEF), GP/LP, 재무적투자자(FI)의 투자·인수·매각·자금회수·리파이낸싱 활동과 직접적으로 관련이 있는지 판별하세요.
+    단순 산업 내 일반 M&A(전략적 인수·경영권 변동 등)는 제외합니다.
+    
+    판단 기준:
+    - 핵심 키워드: {', '.join(kw)}
+    - 동의어: {', '.join(aliases)}
+    - 운용사/FI 워치리스트: {', '.join(firms)}
+    - 맥락 키워드(있으면 강한 근거): {', '.join(context_any)}
+    
+    출력은 반드시 JSON 한 줄:
+    {{
+      "relevant": true|false,
+      "confidence": 0.0~1.0,
+      "category": "PE deal"|"industry M&A"|"finance general"|"irrelevant",
+      "reason": "한 줄 근거"
+    }}
+    
+    기사:
+    - 제목: {item.get('title','')}
+    - 출처: {domain_of(item.get('url',''))}
+    - 링크: {item.get('url','')}
+    """
 
 def _openai_chat(messages: List[Dict], api_key: str, model: str, max_tokens: int = 300, temperature: float = 0.0) -> str:
     url = "https://api.openai.com/v1/chat/completions"
@@ -629,17 +489,17 @@ def llm_filter_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
         return items
 
     model = cfg.get("LLM_MODEL", "gpt-4o-mini")
-    conf_th = float(cfg.get("LLM_CONF_THRESHOLD", 0.7))  # ✅ 완화
+    conf_th = float(cfg.get("LLM_CONF_THRESHOLD", 0.8))  # ✅ 상향
     out = []
 
     for it in items:
         try:
             user_prompt = _llm_prompt_for_item(it, cfg)
             messages = [
-                {"role": "system", "content": "You are a professional financial news classifier for Private Equity (KR). Return JSON only."},
+                {"role": "system", "content": "You are a strict classifier for Private Equity (KR). Return JSON only."},
                 {"role": "user", "content": user_prompt},
             ]
-            resp = _openai_chat(messages, api_key, model, max_tokens=int(cfg.get("LLM_MAX_TOKENS", 400)))
+            resp = _openai_chat(messages, api_key, model, max_tokens=int(cfg.get("LLM_MAX_TOKENS", 300)))
             j = None
             try:
                 j = json.loads(resp.strip())
@@ -649,13 +509,12 @@ def llm_filter_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
                 if m:
                     j = json.loads(m.group(0))
 
-            # ✅ 완화된 조건: PE deal or finance general 둘 다 허용
-            cat = (j or {}).get("category", "").lower()
+            # ✅ category와 confidence 기반 필터링
             if (
                 isinstance(j, dict)
                 and j.get("relevant") is True
+                and j.get("category", "").lower() == "pe deal"
                 and float(j.get("confidence", 0.0)) >= conf_th
-                and cat in {"pe deal", "finance general"}
             ):
                 it["_llm"] = j
                 out.append(it)
@@ -969,15 +828,9 @@ else:
             when = pub.strftime("%Y-%m-%d %H:%M")
         except Exception:
             when = "-"
-        meta = it.get("_llm")
+        meta = it.get("_llm", None)
         if meta:
-            _m = ", ".join([str(x) for x in (meta.get("matched") or [])][:6])
-            st.markdown(
-                f"- <a href='{u}'>{t}</a> ({when})  "
-                f"<span style='color:gray'>LLM: {meta.get('confidence',0):.2f}"
-                + (f" · {_m}" if _m else "")
-                + "</span>",
-                unsafe_allow_html=True
-            )
+            st.markdown(f"- <a href='{u}'>{t}</a> ({when})  "+
+                        f"<span style='color:gray'>LLM: {meta.get('confidence',0):.2f} · {', '.join(meta.get('matched',[]) or [])}</span>", unsafe_allow_html=True)
         else:
             st.markdown(f"- <a href='{u}'>{t}</a> ({when})", unsafe_allow_html=True)
