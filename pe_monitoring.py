@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -33,6 +34,8 @@ CURRENT_ENV = {
     "NAVER_CLIENT_SECRET": os.getenv("NAVER_CLIENT_SECRET", ""),
     "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
     "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", ""),
+    # NEW: OpenAI
+    "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""),
 }
 
 # -------------------------
@@ -219,7 +222,7 @@ def search_newsapi(query: str, page_size: int, api_key: str, from_hours: int = 7
     params = {
         "q": (cfg.get("NEWSAPI_QUERY") if (cfg and cfg.get("NEWSAPI_QUERY")) else query),
         "searchIn": "title",
-        "pageSize": clamp(int(cfg.get("PAGE_SIZE", 30)), 10, 100)(page_size, 10, 100),
+        "pageSize": clamp(int(cfg.get("PAGE_SIZE", 30)), 10, 100),
         "language": "ko",
         "sortBy": "publishedAt",
         "from": from_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -354,7 +357,7 @@ def dedup(items: List[dict]) -> List[dict]:
     return out
 
 # -------------------------
-# 필터/정렬
+# 규칙 기반 필터/정렬
 # -------------------------
 def should_drop(item: dict, cfg: dict) -> bool:
     url = item.get("url", "")
@@ -411,6 +414,90 @@ def rank_filtered(items: List[dict], cfg: dict) -> List[dict]:
     return dedup(arr)
 
 # -------------------------
+# LLM 기반 2차 필터
+# -------------------------
+def _flatten_aliases(cfg: dict) -> List[str]:
+    out = []
+    for k, v in (cfg.get("KEYWORD_ALIASES", {}) or {}).items():
+        out.append(k)
+        out.extend(v or [])
+    return sorted(set(out))
+
+def _llm_prompt_for_item(item: dict, cfg: dict) -> str:
+    kw = cfg.get("KEYWORDS", []) or []
+    aliases = _flatten_aliases(cfg)
+    firms = cfg.get("FIRM_WATCHLIST", []) or []
+    context_any = cfg.get("CONTEXT_REQUIRE_ANY", []) or []
+    text = f"""당신은 '국내 PE 동향' 기사 선별기입니다.
+    아래 기사 제목이 국내 사모펀드/바이아웃/공개매수/M&A/리캡/리파이낸싱 등과 직접적으로 관련 있는지 판단하세요.
+    판단 기준:
+    - config의 핵심 키워드: {', '.join(kw)}
+    - 확장/동의어: {', '.join(aliases)}
+    - 워치리스트(PE 운용사/고유명사): {', '.join(firms)}
+    - 맥락 키워드(있으면 강한 근거): {', '.join(context_any)}
+    출력은 반드시 JSON 한 줄로:
+    {{
+      "relevant": true|false,
+      "confidence": 0.0~1.0,
+      "matched": ["매칭된 단어들"],
+      "reason": "한 줄 근거"
+    }}
+    기사:
+    - 제목: {item.get('title','')}
+    - 출처: {domain_of(item.get('url',''))}
+    - 링크: {item.get('url','')}
+    """
+    return text
+
+def _openai_chat(messages: List[Dict], api_key: str, model: str, max_tokens: int = 300, temperature: float = 0.0) -> str:
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    r = requests.post(url, headers=headers, json=payload, timeout=25)
+    r.raise_for_status()
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+def llm_filter_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
+    if not items:
+        return items
+    if not bool(cfg.get("USE_LLM_FILTER", False)):
+        return items
+    api_key = env.get("OPENAI_API_KEY", "")
+    if not api_key:
+        log.warning("LLM 필터 활성화되어 있으나 OPENAI_API_KEY 미설정 → 규칙기반 결과 사용")
+        return items
+    model = cfg.get("LLM_MODEL", "gpt-4o-mini")
+    conf_th = float(cfg.get("LLM_CONF_THRESHOLD", 0.55))
+    out = []
+    for it in items:
+        try:
+            user_prompt = _llm_prompt_for_item(it, cfg)
+            messages = [
+                {"role": "system", "content": "You are a precise news triage classifier for Private Equity (KR). Always return JSON only."},
+                {"role": "user", "content": user_prompt},
+            ]
+            resp = _openai_chat(messages, api_key, model, max_tokens=int(cfg.get("LLM_MAX_TOKENS", 300)))
+            # JSON 파싱
+            j = None
+            try:
+                j = json.loads(resp.strip().split("```")[-1].strip())
+            except Exception:
+                # 혹시 코드펜스 없이 텍스트만 왔을 때
+                import re as _re
+                m = _re.search(r"\{[\s\S]*\}$", resp.strip())
+                if m:
+                    j = json.loads(m.group(0))
+            if isinstance(j, dict) and bool(j.get("relevant")) and float(j.get("confidence", 0.0)) >= conf_th:
+                it["_llm"] = j
+                out.append(it)
+        except Exception as e:
+            log.warning("LLM 필터 처리 실패: %s", e)
+            # 실패 시 보수적으로 통과
+            out.append(it)
+    return out
+
+# -------------------------
 # 수집/전송
 # -------------------------
 def collect_all(cfg: dict, env: dict) -> List[dict]:
@@ -434,8 +521,7 @@ def collect_all(cfg: dict, env: dict) -> List[dict]:
 
     return all_items
 
-
-def format_telegram_text(items: List[dict], cfg: dict = GLOBAL_CFG if 'GLOBAL_CFG' in globals() else {}) -> str:
+def format_telegram_text(items: List[dict], cfg: dict = {} ) -> str:
     if not items:
         return "📭 신규 뉴스 없음"
     lines = ["📌 <b>국내 PE 동향 관련 뉴스</b>"]
@@ -448,7 +534,10 @@ def format_telegram_text(items: List[dict], cfg: dict = GLOBAL_CFG if 'GLOBAL_CF
             when = pub.strftime("%Y-%m-%d %H:%M")
         except Exception:
             when = "-"
-        lines.append(f"• <a href=\"{u}\">{t}</a> — {src} ({when})" if bool(cfg.get("SHOW_SOURCE_DOMAIN", False)) else f"• <a href=\"{u}\">{t}</a> ({when})")
+        if bool(cfg.get("SHOW_SOURCE_DOMAIN", False)):
+            lines.append(f"• <a href=\"{u}\">{t}</a> — {src} ({when})")
+        else:
+            lines.append(f"• <a href=\"{u}\">{t}</a> ({when})")
     return "\n".join(lines)
 
 def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
@@ -487,7 +576,6 @@ def _should_skip_by_time(cfg: dict) -> bool:
 def get_run_lock() -> Lock:
     return Lock()
 
-
 def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
     run_lock = get_run_lock()
     if not run_lock.acquire(blocking=False):
@@ -495,7 +583,8 @@ def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
         return {"count": 0, "items": []}
     try:
         all_items = collect_all(cfg, env)
-        ranked = rank_filtered(all_items, cfg)
+        ranked = rank_filtered(all_items, cfg)  # 1차: 규칙 기반 필터
+        ranked = llm_filter_items(ranked, cfg, env)  # 2차: LLM 필터 (옵션)
 
         if preview:
             return {"count": len(ranked), "items": ranked}
@@ -528,7 +617,7 @@ def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
         sent_any = False
         for i in range(0, len(new_items), BATCH):
             chunk = new_items[i:i+BATCH]
-            text = format_telegram_text(chunk)
+            text = format_telegram_text(chunk, cfg)
             ok = send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), text)
             sent_any = sent_any or ok
             time.sleep(0.6)
@@ -570,7 +659,6 @@ def ensure_interval_job(sched: BackgroundScheduler, minutes: int):
     sched.add_job(scheduled_job, "interval", minutes=minutes, id=job_id,
                   replace_existing=True, next_run_time=now_kst())
 
-
 def is_running(_: BackgroundScheduler = None) -> bool:
     try:
         sched = get_scheduler()
@@ -611,6 +699,8 @@ cfg = dict(cfg_file)
 naver_id = st.sidebar.text_input("Naver Client ID", type="password", value=os.getenv("NAVER_CLIENT_ID", ""))
 naver_secret = st.sidebar.text_input("Naver Client Secret", type="password", value=os.getenv("NAVER_CLIENT_SECRET", ""))
 newsapi_key = st.sidebar.text_input("NewsAPI Key (선택)", type="password", value=os.getenv("NEWSAPI_KEY", ""))
+# NEW: OpenAI
+openai_key = st.sidebar.text_input("OpenAI API Key (선택)", type="password", value=os.getenv("OPENAI_API_KEY", ""))
 bot_token = st.sidebar.text_input("Telegram Bot Token", type="password", value=os.getenv("TELEGRAM_BOT_TOKEN", ""))
 chat_id = st.sidebar.text_input("Telegram Chat ID (채널/그룹)", value=os.getenv("TELEGRAM_CHAT_ID", ""))
 
@@ -633,18 +723,26 @@ cfg["HOLIDAYS"] = [s.strip() for s in re.split(r"[,\n]", holidays_text) if s.str
 st.sidebar.subheader("기타 필터")
 cfg["ALLOWLIST_STRICT"] = bool(st.sidebar.checkbox("🧱 ALLOWLIST_STRICT (허용 도메인 외 차단)", value=bool(cfg.get("ALLOWLIST_STRICT", True))))
 
+# NEW: LLM 필터 옵션
+st.sidebar.subheader("LLM 필터(선택)")
+cfg["USE_LLM_FILTER"] = bool(st.sidebar.checkbox("🤖 OpenAI로 2차 필터링", value=bool(cfg.get("USE_LLM_FILTER", False))))
+cfg["LLM_MODEL"] = st.sidebar.text_input("모델", value=cfg.get("LLM_MODEL", "gpt-4o-mini"))
+cfg["LLM_CONF_THRESHOLD"] = float(st.sidebar.slider("채택 임계치(신뢰도)", min_value=0.0, max_value=1.0, value=float(cfg.get("LLM_CONF_THRESHOLD", 0.55)), step=0.05))
+cfg["LLM_MAX_TOKENS"] = int(st.sidebar.number_input("max_tokens", min_value=64, max_value=1000, step=10, value=int(cfg.get("LLM_MAX_TOKENS", 300))))
+
 st.sidebar.divider()
 if st.sidebar.button("구성 리로드", use_container_width=True):
     st.rerun()
 
 st.title("📰 국내 PE 동향 뉴스 자동 모니터링")
-st.caption("Streamlit + Naver/NewsAPI + Telegram + APScheduler (Render + UptimeRobot)")
+st.caption("Streamlit + Naver/NewsAPI + OpenAI Filter + Telegram + APScheduler (Render + UptimeRobot)")
 
 def make_env() -> dict:
     return {
         "NAVER_CLIENT_ID": naver_id,
         "NAVER_CLIENT_SECRET": naver_secret,
         "NEWSAPI_KEY": newsapi_key,
+        "OPENAI_API_KEY": openai_key,
         "TELEGRAM_BOT_TOKEN": bot_token,
         "TELEGRAM_CHAT_ID": chat_id,
     }
@@ -662,7 +760,6 @@ with col2:
         res = transmit_once(cfg, make_env(), preview=False)
         st.session_state["preview"] = res
 
-
 with col3:
     if st.button("스케줄 시작"):
         start_schedule(cfg_path=cfg_path, cfg_dict=cfg, env=make_env(), minutes=int(cfg["INTERVAL_MIN"]))
@@ -674,7 +771,6 @@ with col4:
         stop_schedule()
         st.warning("스케줄 중지됨")
         st.rerun()
-
 
 # 상태
 _running = is_running()
@@ -704,19 +800,9 @@ else:
             when = pub.strftime("%Y-%m-%d %H:%M")
         except Exception:
             when = "-"
-        st.markdown(f"- <a href='{u}'>{t}</a> ({when})", unsafe_allow_html=True)
-
-def should_drop(title: str, url: str, cfg: dict):
-    ambiguous = set(cfg.get("STRICT_AMBIGUOUS_TOKENS", []))
-    context   = set(cfg.get("CONTEXT_REQUIRE_ANY", []))
-    tl = (title or "").lower()
-    if any(tok.lower() in tl for tok in ambiguous):
-        if context and not any(ctx.lower() in tl for ctx in context):
-            return True
-    for rx in (cfg.get("EXCLUDE_TITLE_REGEX", []) or []):
-        try:
-            if re.search(rx, title or "", flags=re.I):
-                return True
-        except re.error:
-            pass
-    return False
+        meta = it.get("_llm", None)
+        if meta:
+            st.markdown(f"- <a href='{u}'>{t}</a> ({when})  "+
+                        f"<span style='color:gray'>LLM: {meta.get('confidence',0):.2f} · {', '.join(meta.get('matched',[]) or [])}</span>", unsafe_allow_html=True)
+        else:
+            st.markdown(f"- <a href='{u}'>{t}</a> ({when})", unsafe_allow_html=True)
