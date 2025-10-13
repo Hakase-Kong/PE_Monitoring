@@ -356,40 +356,119 @@ def _sim_norm_title(a: str, b: str) -> float:
     # 토큰 0.6, 바이그램 0.4 가중
     return 0.6 * ja + 0.4 * jb
 
+GENERIC_WORDS = {
+    "분석","해설","전망","이슈","단독","속보","시그널","fn마켓워치","투자360",
+    "영상","포토","르포","사설","칼럼","인터뷰","특집","집중","종합","마켓인","리뷰","현장"
+}
+
+def _signature_tokens(t: str, cfg: dict) -> List[str]:
+    """제목에서 사건을 대표할 토큰만 추출(숫자/일반어 제거, 고유명사 가중)."""
+    base = normalize_title(t)
+    base = re.sub(r"\b\d{1,4}(?:\.\d+)?\b", " ", base)  # 숫자/금액 제거
+    toks = [w for w in re.split(r"[^0-9a-zA-Z가-힣]+", base) if len(w) >= 2]
+
+    keep = set(toks) - GENERIC_WORDS
+    wl = [w.lower() for w in (cfg.get("FIRM_WATCHLIST", []) or [])]
+    amb = [w.lower() for w in (cfg.get("STRICT_AMBIGUOUS_TOKENS", []) or [])]
+    for w in wl + amb:
+        if w in base:
+            keep.add(w)
+
+    # 너무 일반적인 단어 제거
+    for w in ["매각","인수","거래","m&a","시장","기업","국내","해외","자금","투자","우협","본입찰","예비입찰"]:
+        keep.discard(w)
+
+    out = sorted(keep)
+    return out[:8]  # 대표 토큰 상위만
+
+def topic_signature(item: dict, cfg: dict) -> str:
+    """같은 이슈 묶음을 위한 시그니처 문자열."""
+    toks = _signature_tokens(item.get("title",""), cfg)
+    if not toks:
+        return f"host:{domain_of(item.get('url',''))}"
+    return "|".join(toks)
+
 def dedup(items: List[dict]) -> List[dict]:
     """
-    점수 높은 순으로 정렬 후, 동일 이슈(제목 유사 + 동일 출처 + 12h)에 속하면 제거.
+    중복 제거 우선순위 (점수 높은 기사 우선 채택):
+      A) canonical_url_id 일치 → 중복
+      B) 동일 출처 & 시간창 내 & 제목유사도(호스트 기준) ≥ cfg.DEDUP_SIM_HOST → 중복
+      C) 서로 다른 출처더라도 제목유사도(크로스 호스트) ≥ cfg.DEDUP_SIM_XHOST → 중복
+      D) 이슈 시그니처 동일 & 시간창 내 → 중복
+      E) (옵션) LLM matched 토큰 교집합 크기 ≥ cfg.DEDUP_LLM_MATCH_INTERSECT → 중복
     """
     def _ts_kst(it):
         try:
-            return dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ")\
-                     .replace(tzinfo=dt.timezone.utc).astimezone(APP_TZ)
+            return dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).astimezone(APP_TZ)
         except Exception:
             return now_kst()
 
+    # 임계값 로드(없으면 기본값)
+    host_hours  = int(cfg.get("DEDUP_SAME_HOST_HOURS", 24))
+    sig_hours   = int(cfg.get("DEDUP_SIG_HOURS", 36))
+    sim_host    = float(cfg.get("DEDUP_SIM_HOST", 0.58))
+    sim_xhost   = float(cfg.get("DEDUP_SIM_XHOST", 0.72))
+    llm_m_inter = int(cfg.get("DEDUP_LLM_MATCH_INTERSECT", 2))
+
+    # 점수 높은 순
     work = sorted(items, key=lambda x: x.get("_score", 0.0), reverse=True)
-    out, seen = [], []  # seen: dict(t_norm, src, ts)
+
+    out: List[dict] = []
+    seen_titles: List[Dict] = []            # {t_norm, src, ts}
+    seen_by_urlid: Set[str] = set()
+    sig_index: Dict[str, dt.datetime] = {}  # signature -> ts
 
     for it in work:
-        t_norm = normalize_title(it.get("title", ""))
-        src = domain_of(it.get("url", ""))
-        ts = _ts_kst(it)
-        is_dup = False
+        url  = it.get("url","")
+        src  = domain_of(url)
+        ts   = _ts_kst(it)
+        cid  = canonical_url_id(url)
+        tnorm= normalize_title(it.get("title",""))
+        sig  = topic_signature(it, cfg)
 
-        for s in seen:
-            # 동일 출처 & 12시간 이내 & 제목유사도 0.58↑ → 동일 이슈 간주
-            if s["src"] == src and abs((ts - s["ts"]).total_seconds()) <= 12*3600:
-                if _sim_norm_title(t_norm, s["t_norm"]) >= 0.58:
-                    is_dup = True
-                    break
-            # 출처 달라도 제목이 거의 동일(0.72↑)이면 중복
-            if _sim_norm_title(t_norm, s["t_norm"]) >= 0.72:
-                is_dup = True
-                break
+        # A) URL 정규화 키
+        if cid in seen_by_urlid:
+            continue
 
-        if not is_dup:
-            out.append(it)
-            seen.append({"t_norm": t_norm, "src": src, "ts": ts})
+        # B/C) 제목 유사도 기반
+        dup = False
+        for s in seen_titles:
+            dt_hours = abs((ts - s["ts"]).total_seconds())/3600.0
+            sim = _sim_norm_title(tnorm, s["t_norm"])
+
+            # 동일 출처: 좁은 창 + 낮은 임계치
+            if s["src"] == src and dt_hours <= host_hours and sim >= sim_host:
+                dup = True; break
+
+            # 출처 달라도 거의 동일: 높은 임계치
+            if sim >= sim_xhost:
+                dup = True; break
+        if dup:
+            continue
+
+        # D) 이슈 시그니처
+        prev_ts = sig_index.get(sig)
+        if prev_ts and abs((ts - prev_ts).total_seconds())/3600.0 <= sig_hours:
+            continue
+
+        # E) (옵션) LLM matched 토큰 교집합
+        try:
+            m = set((it.get("_llm") or {}).get("matched") or [])
+            if m:
+                for s in out:
+                    m2 = set((s.get("_llm") or {}).get("matched") or [])
+                    if m2 and len(m & m2) >= llm_m_inter:
+                        dup = True; break
+                if dup:
+                    continue
+        except Exception:
+            pass
+
+        # 채택
+        out.append(it)
+        seen_by_urlid.add(cid)
+        seen_titles.append({"t_norm": tnorm, "src": src, "ts": ts})
+        sig_index[sig] = ts
 
     return out
 
