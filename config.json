@@ -1,44 +1,247 @@
 {
   "KEYWORDS": [
-    "PEF",
+    "국내 PE",
     "사모펀드",
     "바이아웃",
-    "공개매수",
     "M&A",
-    "VIG",
-    "MBK",
-    "IMM"
+    "인수합병",
+    "공개매수",
+    "지분 인수",
+    "매각",
+    "딜 클로징",
+    "본입찰",
+    "예비입찰",
+    "리파이낸싱",
+    "리캡",
+    "구주매출",
+    "엑시트",
+    "자금 회수",
+    "IPO 추진",
+    "Pre-IPO",
+    "블라인드펀드",
+    "Growth Capital",
+    "PIPE",
+    "메자닌"
   ],
-  "EXCLUDE_KEYWORDS": [
-    "연예",
-    "스포츠",
-    "브랜드평판"
-  ],
-  "DOMAIN_WHITELIST": [
-    "www.thebell.co.kr",
-    "dealsite.co.kr",
-    "www.investchosun.com",
-    "n.news.naver.com"
-  ],
-  "DOMAIN_BLACKLIST": [
-    "m.entertain.naver.com",
-    "entertain.naver.com"
-  ],
-  "MIN_PUBLISHED_HOURS": 120,
-  "PAGE_SIZE": 30,
-  "MAX_ITEMS": 60,
-  "SHOW_SOURCE_DOMAIN": true,
-  "LLM_ENABLE": true,
-  "LLM_MODEL": "gpt-4o-mini",
-  "LLM_MIN_SCORE": 70,
-  "LLM_BATCH_SIZE": 12,
-  "LLM_SYSTEM_PROMPT": "너는 국내 사모펀드/PE 동향을 선별하는 리서치 어시스턴트다. 기사 제목과 링크, 도메인, 발행시각 정보를 보고 '국내 PE 딜/거래/자금조달 동향'과 직접 관련된 기사만 선별한다. 다음 기준을 지켜라: (1) 단순 연예/스포츠/브랜드평판/주가 변동 기사는 제외 (2) 사모펀드/PEF/바이아웃/M&A/공개매수/경영권/리캡/리파이낸싱/PIPE/메자닌/Pre-IPO, GP/LP 및 주요 운용사(MBK, IMM, VIG 등) 키워드와의 실질적 연관성 판단 (3) 중복·재탕 뉴스는 낮게 점수 (4) 소스 품질(더벨, 인베스트조선, 딜사이트 등) 가점",
-  "LLM_USER_TEMPLATE": "아래 기사들을 0~100점으로 채점하고, 60점 미만은 drop하라. 각 항목은 JSONL로 답하라: {\"keep\":true|false, \"score\":0-100, \"reason\":\"한 줄 근거\"}. 참고 키워드: {{KEYWORDS}}. 참고 운용사 watchlist: {{FIRM_WATCHLIST}}.\n\n기사목록(JSONL):\n{{ITEMS_JSONL}}",
+  "KEYWORD_ALIASES": {
+    "바이아웃": [
+      "바이아웃",
+      "buyout",
+      "경영권 인수",
+      "takeover",
+      "control premium"
+    ],
+    "M&A": [
+      "인수합병",
+      "merger",
+      "acquisition",
+      "M&A",
+      "딜",
+      "거래"
+    ],
+    "공개매수": [
+      "의무공개매수",
+      "TOB",
+      "Tender Offer"
+    ],
+    "리파이낸싱": [
+      "리파이낸싱",
+      "refinancing",
+      "리캡",
+      "리캡딜"
+    ],
+    "엑시트": [
+      "exit",
+      "자금 회수",
+      "투자금 회수",
+      "IPO 추진",
+      "상장 추진"
+    ],
+    "Pre-IPO": [
+      "프리IPO",
+      "Pre IPO",
+      "상장 전 투자",
+      "상장 전"
+    ],
+    "블라인드펀드": [
+      "블라인드 펀드",
+      "blind fund",
+      "신규 펀드 결성",
+      "신규펀드"
+    ],
+    "Growth Capital": [
+      "그로스 캐피탈",
+      "growth capital",
+      "지분투자"
+    ],
+    "PIPE": [
+      "PIPE 투자",
+      "상장사 투자",
+      "주식인수"
+    ],
+    "메자닌": [
+      "메자닌",
+      "전환사채",
+      "교환사채",
+      "CB",
+      "EB"
+    ]
+  },
   "FIRM_WATCHLIST": [
     "MBK",
+    "한앤컴퍼니",
     "IMM",
-    "Hahn&Company",
     "VIG",
-    "한앤컴퍼니"
-  ]
+    "케이스톤",
+    "KCGI",
+    "큐리어스",
+    "H&Q",
+    "스틱인베스트먼트",
+    "스카이레이크",
+    "한투PE",
+    "맥쿼리",
+    "칼라일",
+    "KKR",
+    "블랙스톤",
+    "TPG",
+    "어피니티",
+    "EQT",
+    "베인캐피탈",
+    "CVC",
+    "페미라",
+    "프리미어파트너스"
+  ],
+  "ALLOW_DOMAINS": [
+    "news.naver.com",
+    "n.news.naver.com",
+    "www.thebell.co.kr",
+    "www.investchosun.com",
+    "dealsite.co.kr"
+  ],
+  "BLOCK_DOMAINS": [
+    "sports.naver.com",
+    "m.sports.naver.com"
+  ],
+  "INCLUDE_TITLE_KEYWORDS": [
+    "PE",
+    "사모펀드",
+    "바이아웃",
+    "인수",
+    "매각",
+    "M&A",
+    "리캡",
+    "리파이낸싱",
+    "구주매출",
+    "경영권",
+    "공개매수",
+    "프라이빗에쿼티",
+    "private equity",
+    "엑시트",
+    "Pre-IPO",
+    "블라인드펀드",
+    "메자닌",
+    "PIPE"
+  ],
+  "EXCLUDE_TITLE_KEYWORDS": [
+    "야구",
+    "축구",
+    "배구",
+    "농구",
+    "골프",
+    "e스포츠",
+    "올림픽",
+    "월드컵",
+    "부고",
+    "부음",
+    "인사",
+    "승진",
+    "임명",
+    "발령",
+    "브랜드 평판",
+    "브랜드평판",
+    "연예",
+    "팬미팅",
+    "콘서트",
+    "뮤직비디오",
+    "공연",
+    "축제",
+    "페스티벌",
+    "주가",
+    "증시",
+    "상한가",
+    "하한가",
+    "장중",
+    "마감"
+  ],
+  "DOMAIN_WEIGHTS": {
+    "www.thebell.co.kr": 3.0,
+    "www.investchosun.com": 3.0,
+    "dealsite.co.kr": 1.8,
+    "news.naver.com": 1.0,
+    "n.news.naver.com": 1.0
+  },
+  "STRICT_AMBIGUOUS_TOKENS": [
+    "매각",
+    "인수",
+    "M&A",
+    "거래",
+    "출자",
+    "투자"
+  ],
+  "CONTEXT_REQUIRE_ANY": [
+    "사모펀드",
+    "PE",
+    "PEF",
+    "프라이빗에쿼티",
+    "공개매수",
+    "경영권",
+    "지분 인수",
+    "본입찰",
+    "예비입찰",
+    "우선협상",
+    "바이아웃",
+    "컨티뉴에이션",
+    "리캡",
+    "리파이낸싱",
+    "PIPE",
+    "메자닌",
+    "GP",
+    "LP",
+    "MBK",
+    "IMM",
+    "VIG",
+    "KCGI",
+    "한앤컴퍼니",
+    "CVC",
+    "KKR",
+    "TPG",
+    "칼라일",
+    "EQT",
+    "블랙스톤"
+  ],
+  "EXCLUDE_TITLE_REGEX": [
+    "(상속세|물납|종부세|국세청)"
+  ],
+  "RECENCY_HOURS": 72,
+  "CACHE_RETENTION_HOURS": 72,
+  "ONLY_WORKING_HOURS": true,
+  "HOLIDAYS": [],
+  "TELEGRAM_DISABLE_PREVIEW": true,
+  "SHOW_SOURCE_DOMAIN": false,
+  "NO_NEWS_SILENT": true,
+  "MAX_PER_KEYWORD": 8,
+  "PAGE_SIZE": 30,
+  "INTERVAL_MIN": 60,
+  "ALLOWLIST_STRICT": true,
+  "NAVER_ALLOW_SIDS": [
+    "101"
+  ],
+  "NEWSAPI_DOMAINS": [
+    "www.thebell.co.kr",
+    "www.investchosun.com",
+    "dealsite.co.kr",
+    "news.naver.com",
+    "n.news.naver.com"
+  ],
+  "NEWSAPI_QUERY": "(\"private equity\" OR 사모펀드 OR 바이아웃 OR 공개매수 OR \"M&A\" OR 인수 OR 매각)"
 }
