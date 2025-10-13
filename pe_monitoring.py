@@ -315,8 +315,8 @@ def _tokens(s: str) -> set:
 def _bigrams(s: str) -> set:
     return {s[i:i+2] for i in range(len(s)-1)} if len(s) > 1 else set()
 
-def is_near_dup(a: str, b: str) -> bool:
-    """정규화 제목 a,b 근접 중복 판단."""
+def is_near_dup(a: str, b: str, time_a=None, time_b=None, src_a=None, src_b=None) -> bool:
+    """정규화 제목 a,b 근접 중복 판단 (출처+시간 보강)."""
     if not a or not b:
         return False
     if a == b:
@@ -333,6 +333,14 @@ def is_near_dup(a: str, b: str) -> bool:
             return True
     if a in b or b in a:
         return True
+    # ✅ 추가: 동일 출처+12시간 이내 기사 → 동일 이슈 간주
+    try:
+        if src_a and src_b and src_a == src_b and time_a and time_b:
+            tdiff = abs((time_a - time_b).total_seconds()) / 3600.0
+            if tdiff <= 12 and j_bg >= 0.45:
+                return True
+    except Exception:
+        pass
     return False
 
 def dedup(items: List[dict]) -> List[dict]:
@@ -391,6 +399,13 @@ def should_drop(item: dict, cfg: dict) -> bool:
         if w and w.lower() in title.lower():
             return True
 
+    # ✅ 추가: PEF 맥락 필수 조건
+    context_any = cfg.get("CONTEXT_REQUIRE_ANY", [])
+    context = (title + " " + item.get("description", "")).lower()
+    if not any(k.lower() in context for k in context_any):
+        # 사모펀드/PE 관련 단어가 전혀 없으면 제외
+        return True
+
     return False
 
 def score_item(item: dict, cfg: dict) -> float:
@@ -428,26 +443,30 @@ def _llm_prompt_for_item(item: dict, cfg: dict) -> str:
     aliases = _flatten_aliases(cfg)
     firms = cfg.get("FIRM_WATCHLIST", []) or []
     context_any = cfg.get("CONTEXT_REQUIRE_ANY", []) or []
-    text = f"""당신은 '국내 PE 동향' 기사 선별기입니다.
-    아래 기사 제목이 국내 사모펀드/바이아웃/공개매수/M&A/리캡/리파이낸싱 등과 직접적으로 관련 있는지 판단하세요.
+    return f"""
+    당신은 '국내 PE 동향' 관련 기사를 분류하는 전문가입니다.
+    다음 기사가 사모펀드(PEF), GP/LP, 재무적투자자(FI)의 투자·인수·매각·자금회수·리파이낸싱 활동과 직접적으로 관련이 있는지 판별하세요.
+    단순 산업 내 일반 M&A(전략적 인수·경영권 변동 등)는 제외합니다.
+    
     판단 기준:
-    - config의 핵심 키워드: {', '.join(kw)}
-    - 확장/동의어: {', '.join(aliases)}
-    - 워치리스트(PE 운용사/고유명사): {', '.join(firms)}
+    - 핵심 키워드: {', '.join(kw)}
+    - 동의어: {', '.join(aliases)}
+    - 운용사/FI 워치리스트: {', '.join(firms)}
     - 맥락 키워드(있으면 강한 근거): {', '.join(context_any)}
-    출력은 반드시 JSON 한 줄로:
+    
+    출력은 반드시 JSON 한 줄:
     {{
       "relevant": true|false,
       "confidence": 0.0~1.0,
-      "matched": ["매칭된 단어들"],
+      "category": "PE deal"|"industry M&A"|"finance general"|"irrelevant",
       "reason": "한 줄 근거"
     }}
+    
     기사:
     - 제목: {item.get('title','')}
     - 출처: {domain_of(item.get('url',''))}
     - 링크: {item.get('url','')}
     """
-    return text
 
 def _openai_chat(messages: List[Dict], api_key: str, model: str, max_tokens: int = 300, temperature: float = 0.0) -> str:
     url = "https://api.openai.com/v1/chat/completions"
@@ -463,38 +482,47 @@ def llm_filter_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
         return items
     if not bool(cfg.get("USE_LLM_FILTER", False)):
         return items
+
     api_key = env.get("OPENAI_API_KEY", "")
     if not api_key:
         log.warning("LLM 필터 활성화되어 있으나 OPENAI_API_KEY 미설정 → 규칙기반 결과 사용")
         return items
+
     model = cfg.get("LLM_MODEL", "gpt-4o-mini")
-    conf_th = float(cfg.get("LLM_CONF_THRESHOLD", 0.55))
+    conf_th = float(cfg.get("LLM_CONF_THRESHOLD", 0.8))  # ✅ 상향
     out = []
+
     for it in items:
         try:
             user_prompt = _llm_prompt_for_item(it, cfg)
             messages = [
-                {"role": "system", "content": "You are a precise news triage classifier for Private Equity (KR). Always return JSON only."},
+                {"role": "system", "content": "You are a strict classifier for Private Equity (KR). Return JSON only."},
                 {"role": "user", "content": user_prompt},
             ]
             resp = _openai_chat(messages, api_key, model, max_tokens=int(cfg.get("LLM_MAX_TOKENS", 300)))
-            # JSON 파싱
             j = None
             try:
-                j = json.loads(resp.strip().split("```")[-1].strip())
+                j = json.loads(resp.strip())
             except Exception:
-                # 혹시 코드펜스 없이 텍스트만 왔을 때
                 import re as _re
                 m = _re.search(r"\{[\s\S]*\}$", resp.strip())
                 if m:
                     j = json.loads(m.group(0))
-            if isinstance(j, dict) and bool(j.get("relevant")) and float(j.get("confidence", 0.0)) >= conf_th:
+
+            # ✅ category와 confidence 기반 필터링
+            if (
+                isinstance(j, dict)
+                and j.get("relevant") is True
+                and j.get("category", "").lower() == "pe deal"
+                and float(j.get("confidence", 0.0)) >= conf_th
+            ):
                 it["_llm"] = j
                 out.append(it)
+
         except Exception as e:
             log.warning("LLM 필터 처리 실패: %s", e)
-            # 실패 시 보수적으로 통과
             out.append(it)
+
     return out
 
 # -------------------------
