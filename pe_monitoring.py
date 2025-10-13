@@ -343,25 +343,54 @@ def is_near_dup(a: str, b: str, time_a=None, time_b=None, src_a=None, src_b=None
         pass
     return False
 
+def _jaccard_bigrams(s: str) -> float:
+    a = _bigrams(s); 
+    return 0.0 if not a else len(a)
+
+def _sim_norm_title(a: str, b: str) -> float:
+    # 토큰/바이그램 혼합 유사도 (0~1)
+    ta, tb = _tokens(a), _tokens(b)
+    ja = len(ta & tb) / max(1, len(ta | tb)) if ta and tb else 0.0
+    ba, bb = _bigrams(a), _bigrams(b)
+    jb = len(ba & bb) / max(1, len(ba | bb)) if ba and bb else 0.0
+    # 토큰 0.6, 바이그램 0.4 가중
+    return 0.6 * ja + 0.4 * jb
+
 def dedup(items: List[dict]) -> List[dict]:
-    """URL 정규화 → 제목 근사 중복 제거 2단계."""
-    out, seen_by_id, seen_titles = [], set(), []
-    for it in items:
-        url = it.get("url", "")
-        cid = canonical_url_id(url)
-        if cid in seen_by_id:
-            continue
-        norm_t = normalize_title(it.get("title", ""))
-        dup = False
-        for prev_norm, _idx in seen_titles:
-            if is_near_dup(norm_t, prev_norm):
-                dup = True
+    """
+    점수 높은 순으로 정렬 후, 동일 이슈(제목 유사 + 동일 출처 + 12h)에 속하면 제거.
+    """
+    def _ts_kst(it):
+        try:
+            return dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ")\
+                     .replace(tzinfo=dt.timezone.utc).astimezone(APP_TZ)
+        except Exception:
+            return now_kst()
+
+    work = sorted(items, key=lambda x: x.get("_score", 0.0), reverse=True)
+    out, seen = [], []  # seen: dict(t_norm, src, ts)
+
+    for it in work:
+        t_norm = normalize_title(it.get("title", ""))
+        src = domain_of(it.get("url", ""))
+        ts = _ts_kst(it)
+        is_dup = False
+
+        for s in seen:
+            # 동일 출처 & 12시간 이내 & 제목유사도 0.58↑ → 동일 이슈 간주
+            if s["src"] == src and abs((ts - s["ts"]).total_seconds()) <= 12*3600:
+                if _sim_norm_title(t_norm, s["t_norm"]) >= 0.58:
+                    is_dup = True
+                    break
+            # 출처 달라도 제목이 거의 동일(0.72↑)이면 중복
+            if _sim_norm_title(t_norm, s["t_norm"]) >= 0.72:
+                is_dup = True
                 break
-        if dup:
-            continue
-        seen_by_id.add(cid)
-        seen_titles.append((norm_t, len(out)))
-        out.append(it)
+
+        if not is_dup:
+            out.append(it)
+            seen.append({"t_norm": t_norm, "src": src, "ts": ts})
+
     return out
 
 # -------------------------
@@ -409,7 +438,7 @@ def should_drop(item: dict, cfg: dict) -> bool:
 
     has_context = any(k.lower() in context for k in context_any)
 
-    trusted = set(cfg.get("TRUSTED_SOURCES_FOR_FI", cfg.get("ALLOW_DOMAINS", [])) or [])
+    trusted = set(cfg.get("TRUSTED_SOURES_FOR_FI", cfg.get("ALLOW_DOMAINS", [])) or [])
     amb_tokens = set(t.lower() for t in (cfg.get("STRICT_AMBIGUOUS_TOKENS", []) or []))
     has_ambiguous = any(tok in title.lower() for tok in amb_tokens)
 
@@ -472,6 +501,7 @@ def _llm_prompt_for_item(item: dict, cfg: dict) -> str:
   "relevant": true|false,
   "confidence": 0.0~1.0,
   "category": "PE deal"|"finance general"|"industry M&A"|"irrelevant",
+  "matched": ["매칭된 단어들"],
   "reason": "한 줄 근거"
 }}
 
@@ -842,9 +872,15 @@ else:
             when = pub.strftime("%Y-%m-%d %H:%M")
         except Exception:
             when = "-"
-        meta = it.get("_llm", None)
+        meta = it.get("_llm")
         if meta:
-            st.markdown(f"- <a href='{u}'>{t}</a> ({when})  "+
-                        f"<span style='color:gray'>LLM: {meta.get('confidence',0):.2f} · {', '.join(meta.get('matched',[]) or [])}</span>", unsafe_allow_html=True)
+            _m = ", ".join([str(x) for x in (meta.get("matched") or [])][:6])
+            st.markdown(
+                f"- <a href='{u}'>{t}</a> ({when})  "
+                f"<span style='color:gray'>LLM: {meta.get('confidence',0):.2f}"
+                + (f" · {_m}" if _m else "")
+                + "</span>",
+                unsafe_allow_html=True
+            )
         else:
             st.markdown(f"- <a href='{u}'>{t}</a> ({when})", unsafe_allow_html=True)
