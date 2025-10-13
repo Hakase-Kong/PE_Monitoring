@@ -246,6 +246,6 @@
   "NEWSAPI_QUERY": "(\\\"private equity\\\" OR 사모펀드 OR 바이아웃 OR 공개매수 OR \\\"M&A\\\" OR 인수 OR 매각)",
   "USE_LLM_FILTER": true,
   "LLM_MODEL": "gpt-4o-mini",
-  "LLM_CONF_THRESHOLD": 0.8,
+  "LLM_CONF_THRESHOLD": 0.7,
   "LLM_MAX_TOKENS": 400
 }
