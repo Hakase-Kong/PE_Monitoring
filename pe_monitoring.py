@@ -483,6 +483,9 @@ def _llm_prompt_for_item(item: dict, cfg: dict) -> str:
     kw = cfg.get("KEYWORDS", []) or []
     aliases = _flatten_aliases(cfg)
     firms = cfg.get("FIRM_WATCHLIST", []) or []
+    selected_firms = cfg.get("SELECTED_FIRMS", [])
+    if selected_firms:
+        firms = selected_firms  # 사용자가 체크한 운용사만 집중 감시
     context_any = cfg.get("CONTEXT_REQUIRE_ANY", []) or []
     return f"""
 당신은 '국내 PE 동향' 관련 기사를 분류하는 전문가입니다.
@@ -903,7 +906,7 @@ chat_id = st.sidebar.text_input("Telegram Chat ID (채널/그룹)", value=os.get
 st.sidebar.divider()
 st.sidebar.subheader("전송/수집 파라미터")
 cfg["PAGE_SIZE"] = int(st.sidebar.number_input("페이지당 수집 수", min_value=10, max_value=100, step=1, value=int(cfg.get("PAGE_SIZE", 30))))
-cfg["INTERVAL_MIN"] = int(st.sidebar.number_input("전송 주기(분)", min_value=5, max_value=360, step=5, value=int(cfg.get("INTERVAL_MIN", cfg.get("TRANSMIT_INTERVAL_MIN", 60)))))
+cfg["INTERVAL_MIN"] = int(st.sidebar.number_input("전송 주기(분)", min_value=5, max_value=1440, step=5, value=int(cfg.get("INTERVAL_MIN", cfg.get("TRANSMIT_INTERVAL_MIN", 1440)))))
 cfg["RECENCY_HOURS"] = int(st.sidebar.number_input("신선도(최근 N시간)", min_value=6, max_value=168, step=6, value=int(cfg.get("RECENCY_HOURS", 72))))
 
 # ✅ 시간 정책 토글
@@ -924,6 +927,12 @@ cfg["USE_LLM_FILTER"] = bool(st.sidebar.checkbox("🤖 OpenAI로 2차 필터링"
 cfg["LLM_MODEL"] = st.sidebar.text_input("모델", value=cfg.get("LLM_MODEL", "gpt-4o-mini"))
 cfg["LLM_CONF_THRESHOLD"] = float(st.sidebar.slider("채택 임계치(신뢰도)", min_value=0.0, max_value=1.0, value=float(cfg.get("LLM_CONF_THRESHOLD", 0.7)), step=0.05))
 cfg["LLM_MAX_TOKENS"] = int(st.sidebar.number_input("max_tokens", min_value=64, max_value=1000, step=10, value=int(cfg.get("LLM_MAX_TOKENS", 300))))
+
+# 🔍 특정 PE 운용사 세부 모니터링
+st.sidebar.subheader("관심 PE 운용사 선택")
+all_firms = cfg.get("FIRM_WATCHLIST", [])
+selected_firms = st.sidebar.multiselect("세부 관찰할 PE 선택", all_firms, default=[])
+cfg["SELECTED_FIRMS"] = selected_firms
 
 st.sidebar.divider()
 if st.sidebar.button("구성 리로드", use_container_width=True):
