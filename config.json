@@ -263,7 +263,7 @@
   "USE_LLM_FILTER": true,
   "LLM_MODEL": "gpt-4o-mini",
   "LLM_CONF_THRESHOLD": 0.7,
-  "LLM_MAX_TOKENS": 400
+  "LLM_MAX_TOKENS": 400,
   "USE_LLM_DEDUP": true,
   "LLM_DEDUP_WINDOW_HOURS": 24
 }
