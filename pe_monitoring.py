@@ -576,6 +576,122 @@ def llm_filter_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
     return out
 
 # -------------------------
+# LLM 기반 2차 중복 제거 (동일 기사/이슈 판정)
+# -------------------------
+def _llm_is_same_story(a: dict, b: dict, env: dict, cfg: dict) -> Optional[bool]:
+    """
+    두 기사가 '같은 스토리(동일 기사/동일 이슈 재보도)'인지 LLM으로 판정.
+    True: 동일 스토리, False: 다른 스토리, None: 판정 실패(보류)
+    """
+    api_key = env.get("OPENAI_API_KEY", "")
+    if not api_key:
+        return None
+
+    def _fmt(it: dict) -> str:
+        t = (it.get("title") or "").strip()
+        u = (it.get("url") or "").strip()
+        s = (domain_of(u) or it.get("source") or "").strip()
+        when = it.get("publishedAt") or ""
+        return f"- 제목: {t}\n- 출처: {s}\n- 시각(UTC): {when}\n- 링크: {u}"
+
+    sys = (
+        "You are a professional news deduplication judge for Korean finance news.\n"
+        "Task: Decide if two news items are about the SAME story (same underlying article/issue), "
+        "even if titles differ slightly (follow-ups, minor edits, copy on portal vs. source). "
+        "Consider: title meaning, named entities, seller/buyer, price/size, and timing.\n"
+        "Answer strictly in JSON: {\"same\": true|false, \"reason\": \"...\"}"
+    )
+    usr = "기사 A\n" + _fmt(a) + "\n\n기사 B\n" + _fmt(b) + "\n\n판정:"
+
+    try:
+        resp = _openai_chat(
+            [{"role": "system", "content": sys}, {"role": "user", "content": usr}],
+            api_key,
+            cfg.get("LLM_MODEL", "gpt-4o-mini"),
+            max_tokens=200,
+            temperature=0.0,
+        )
+        j = None
+        try:
+            j = json.loads(resp.strip())
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}$", resp.strip())
+            if m:
+                j = json.loads(m.group(0))
+        if isinstance(j, dict) and "same" in j:
+            return bool(j.get("same"))
+    except Exception as e:
+        log.warning("LLM dedup 오류: %s", e)
+    return None
+
+
+def _utc_to_kst(ts: str) -> dt.datetime:
+    try:
+        return dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).astimezone(APP_TZ)
+    except Exception:
+        return now_kst()
+
+
+def llm_dedup_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
+    """
+    1차 규칙기반 dedup 이후에도 남는 '유사하지만 애매한' 케이스를 LLM으로 다시 한 번 정리.
+    - 후보 페어: 제목유사도 0.50~0.72 구간 또는 동일출처±시간창 내 기사
+    - 동일 스토리로 판정되면 _score 낮은 쪽을 제거
+    """
+    if not items or not cfg.get("USE_LLM_DEDUP", False):
+        return items
+    if not env.get("OPENAI_API_KEY"):
+        return items
+
+    win_hours = int(cfg.get("LLM_DEDUP_WINDOW_HOURS", 24))
+    keep_mask = [True] * len(items)
+
+    # 사전 계산: 정규화 제목/출처/시각
+    meta = []
+    for it in items:
+        tnorm = normalize_title(it.get("title", ""))
+        src = domain_of(it.get("url", ""))
+        ts_kst = _utc_to_kst(it.get("publishedAt", ""))
+        sc = float(it.get("_score", 0.0))
+        meta.append((tnorm, src, ts_kst, sc))
+
+    n = len(items)
+    for i in range(n):
+        if not keep_mask[i]:
+            continue
+        for j in range(i + 1, n):
+            if not keep_mask[j]:
+                continue
+
+            a_t, a_s, a_ts, a_sc = meta[i]
+            b_t, b_s, b_ts, b_sc = meta[j]
+
+            # 시간창 & 출처 조건
+            time_ok = abs((a_ts - b_ts).total_seconds()) <= win_hours * 3600
+            src_same = (a_s == b_s)
+
+            # 제목 유사도
+            sim = _sim_norm_title(a_t, b_t)
+
+            # LLM 판정 후보 조건(너무 명확/너무 다른 것은 제외)
+            if (0.50 <= sim < 0.72) or (src_same and time_ok and sim >= 0.45):
+                same = _llm_is_same_story(items[i], items[j], env, cfg)
+                if same is True:
+                    # 낮은 점수 쪽을 제거
+                    if a_sc >= b_sc:
+                        keep_mask[j] = False
+                    else:
+                        keep_mask[i] = False
+                        break  # i가 제거되었으므로 내부 루프 탈출
+                elif same is False:
+                    continue
+                else:
+                    # 판정 실패는 보류
+                    continue
+
+    return [it for k, it in enumerate(items) if keep_mask[k]]
+
+# -------------------------
 # 수집/전송
 # -------------------------
 def collect_all(cfg: dict, env: dict) -> List[dict]:
@@ -663,6 +779,7 @@ def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
         all_items = collect_all(cfg, env)
         ranked = rank_filtered(all_items, cfg)  # 1차: 규칙 기반 필터
         ranked = llm_filter_items(ranked, cfg, env)  # 2차: LLM 필터 (옵션)
+        ranked = llm_dedup_items(ranked, cfg, env)   # 3차: LLM 중복판정 (옵션) ← ✅ 여기 추가
 
         if preview:
             return {"count": len(ranked), "items": ranked}
