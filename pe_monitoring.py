@@ -77,7 +77,7 @@ def is_holiday(kst: dt.datetime, holidays: List[str]) -> bool:
     ymd = kst.strftime("%Y-%m-%d")
     return ymd in set(holidays or [])
 
-def between_working_hours(kst: dt.datetime, start=8, end=20) -> bool:
+def between_working_hours(kst: dt.datetime, start=6, end=20) -> bool:
     return start <= kst.hour < end
 
 # ===== [Scheduler Helpers] =====
@@ -149,10 +149,6 @@ def save_sent_cache(hashes: Set[str]) -> None:
     except Exception as e:
         log.warning("전송 캐시 저장 실패: %s", e)
 
-# -------------------------
-# 외부 API (Naver / NewsAPI)
-# -------------------------
-
 # ===== [NEW] Story Key & Enhanced Cache (v2) =====
 def story_key(item: dict) -> str:
     """
@@ -223,6 +219,9 @@ def save_sent_cache_v2(url_map: dict, story_map: dict) -> None:
     except Exception as e:
         log.warning("전송 캐시 저장 실패(v2): %s", e)
 
+# -------------------------
+# 외부 API (Naver / NewsAPI)
+# -------------------------
 def search_naver_news(keyword: str, client_id: str, client_secret: str, recency_hours=72, page_size: int = 30) -> List[dict]:
     if not client_id or not client_secret or not keyword:
         return []
@@ -427,13 +426,13 @@ def dedup(items: List[dict]) -> List[dict]:
         is_dup = False
 
         for s in seen:
-            # 동일 출처 & 12시간 이내 & 제목유사도 0.58↑ → 동일 이슈 간주
+            # 동일 출처 & 12시간 이내 & 제목유사도 0.55↑ → 동일 이슈 간주 (조정)
             if s["src"] == src and abs((ts - s["ts"]).total_seconds()) <= 12*3600:
-                if _sim_norm_title(t_norm, s["t_norm"]) >= 0.58:
+                if _sim_norm_title(t_norm, s["t_norm"]) >= 0.55:
                     is_dup = True
                     break
-            # 출처 달라도 제목이 거의 동일(0.72↑)이면 중복
-            if _sim_norm_title(t_norm, s["t_norm"]) >= 0.72:
+            # 출처 달라도 제목이 거의 동일(0.68↑)이면 중복 (조정)
+            if _sim_norm_title(t_norm, s["t_norm"]) >= 0.68:
                 is_dup = True
                 break
 
@@ -518,7 +517,7 @@ def rank_filtered(items: List[dict], cfg: dict) -> List[dict]:
     return dedup(arr)
 
 # -------------------------
-# LLM 기반 2차 필터
+# LLM 기반 2차 필터 (부정-선택형 + 하이브리드 컷)
 # -------------------------
 def _flatten_aliases(cfg: dict) -> List[str]:
     out = []
@@ -569,7 +568,9 @@ def _openai_chat(messages: List[Dict], api_key: str, model: str, max_tokens: int
     return data["choices"][0]["message"]["content"]
 
 def llm_filter_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
-    if not items or not bool(cfg.get("USE_LLM_FILTER", False)):
+    if not items:
+        return items
+    if not bool(cfg.get("USE_LLM_FILTER", False)):
         return items
 
     api_key = env.get("OPENAI_API_KEY", "")
@@ -615,7 +616,9 @@ def llm_filter_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
             try:
                 meta = json.loads(resp.strip())
             except Exception:
-                m = re.search(r"\{[\s\S]*\}$", resp.strip()); meta = json.loads(m.group(0)) if m else None
+                m = re.search(r"\{[\s\S]*\}$", resp.strip())
+                if m:
+                    meta = json.loads(m.group(0))
 
             # 기본은 통과(KEEP). 아래 조건에서만 DROP.
             drop = False
@@ -631,18 +634,28 @@ def llm_filter_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
                 # 부정-선택형: irrelevant 이면서 확신이 높을 때만 드롭
                 if (rel is False) and (conf >= drop_th):
                     drop = True
+                    it["_drop_reason"] = f"LLM irrelevant@{conf:.2f}"
+
+                # (하이브리드 컷) industry M&A로 높은 신뢰 분류 + 키워드/운용사 없음 → 컷
+                if (not drop) and (rel is True) and (cat == "industry m&a") and (conf >= max(0.75, base_th)):
+                    if not _has_kw_or_firm(title):
+                        drop = True
+                        it["_drop_reason"] = f"LLM industry_mna_only@{conf:.2f}"
 
                 it["_llm"] = meta
 
             if not drop:
                 out.append(it)
             else:
-                it["_drop_reason"] = f"LLM irrelevant@{conf:.2f}"
                 log.info("LLM drop: %s | %s", it.get("title",""), it.get('url',""))
 
         except Exception as e:
             log.warning("LLM 필터 실패(보류): %s", e)
-            out.append(it)  # 실패 시 보수적으로 KEEP
+            # 파싱 실패 시: 신뢰도메인 아니고 키워드도 없으면 보수적 DROP
+            if (src not in trusted) and (not _has_kw_or_firm(title)):
+                it["_drop_reason"] = "LLM_parse_fail_and_weak"
+                continue
+            out.append(it)  # 신뢰도메인/키워드 있으면 KEEP
 
     return out
 
@@ -714,7 +727,7 @@ def llm_dedup_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
     if not env.get("OPENAI_API_KEY"):
         return items
 
-    win_hours = int(cfg.get("LLM_DEDUP_WINDOW_HOURS", 24))
+    win_hours = int(cfg.get("LLM_DEDUP_WINDOW_HOURS", 36))  # 24 → 36으로 확장
     keep_mask = [True] * len(items)
 
     # 사전 계산: 정규화 제목/출처/시각
@@ -823,7 +836,7 @@ def send_telegram(bot_token: str, chat_id: str, text: str, disable_preview: bool
 
 def _should_skip_by_time(cfg: dict) -> bool:
     kst_now = now_kst()
-    if cfg.get("ONLY_WORKING_HOURS") and not between_working_hours(kst_now, 6, 20):  # 08→06
+    if cfg.get("ONLY_WORKING_HOURS") and not between_working_hours(kst_now, 6, 20):
         return True
     if cfg.get("BLOCK_WEEKEND") and is_weekend(kst_now):
         return True
@@ -846,9 +859,9 @@ def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
     try:
         all_items = collect_all(cfg, env)
         ranked = rank_filtered(all_items, cfg)  # 1차: 규칙 기반 필터
-        ranked = pe_focus_filter(ranked, cfg) # PE 선택 필터
+        ranked = pe_focus_filter(ranked, cfg)   # PE 선택 필터
         ranked = llm_filter_items(ranked, cfg, env)  # 2차: LLM 필터 (옵션)
-        ranked = llm_dedup_items(ranked, cfg, env)   # 3차: LLM 중복판정 (옵션) ← ✅ 여기 추가
+        ranked = llm_dedup_items(ranked, cfg, env)   # 3차: LLM 중복판정 (옵션)
 
         if preview:
             return {"count": len(ranked), "items": ranked}
@@ -920,7 +933,7 @@ def is_running(_: BackgroundScheduler = None) -> bool:
     except Exception:
         return False
 
-# 스케줄 시작/중지(버튼 핸들러용) — 여기서만 global 사용
+# 스케줄 시작/중지(버튼 핸들러용)
 def start_schedule(cfg_path: str, cfg_dict: dict, env: dict, minutes: int):
     """
     버튼 클릭 시 스케줄 시작.
@@ -1017,20 +1030,15 @@ if cfg["SCHEDULE_MODE"] == "주기(분)":
 
 # (신규) 요일/시각 스케줄: 주 1회 또는 매일
 else:
-    # 선택 가능한 요일
     WEEKDAY_LABELS = ["매일", "월", "화", "수", "목", "금", "토", "일"]
-    # 기본 선택값
     default_days = cfg.get("CRON_DAYS_UI", ["매일"])
-    # UI: 다중 선택
     selected_days = st.sidebar.multiselect(
         "전송 요일 선택 (매일을 선택하면 다른 요일은 무시됩니다)",
         options=WEEKDAY_LABELS,
         default=default_days
     )
-    # 결과 저장 (UI 표기 그대로도 보존)
     cfg["CRON_DAYS_UI"] = selected_days[:] if selected_days else ["매일"]
 
-    # 시간 선택
     t = st.sidebar.time_input(
         "전송 시각 (KST)",
         value=dt.time(hour=int(cfg.get("CRON_HOUR", 9)), minute=int(cfg.get("CRON_MINUTE", 0)))
@@ -1053,7 +1061,6 @@ cfg["LLM_MAX_TOKENS"] = int(st.sidebar.number_input("max_tokens", min_value=64, 
 
 # ===== [UI] 특정 PE 선택 =====
 st.sidebar.subheader("🎯 특정 PE 선택(선택)")
-# 후보 목록은 config.json의 "PE_CANDIDATES"를 우선 사용, 없으면 아래 기본
 pe_candidates_default = [
     "MBK", "IMM", "Hahn&Co", "VIG", "글랜우드", "베인", "KKR", "Carlyle", "한앤코",
     "스틱", "H&Q", "브릿지", "JIP", "Affinity", "TPG", "KCGI", "한화", "맥쿼리"
@@ -1123,7 +1130,7 @@ st.info(f"Scheduler 실행 중: {_running}")
 for j in jobs:
     st.caption(f"• Job: {j.id} / 다음 실행: {j.next_run_time}")
 
-# 미리보기 결과 — 전체 필터링 기사만 표시 (Top10 없음)
+# 미리보기 결과 — 전체 필터링 기사만 표시
 st.subheader("📋 필터링된 전체 기사")
 res = st.session_state.get("preview", {"items": []})
 items = res.get("items", [])
@@ -1139,14 +1146,16 @@ else:
         except Exception:
             when = "-"
         meta = it.get("_llm")
-        if meta:
-            _m = ", ".join([str(x) for x in (meta.get("matched") or [])][:6])
-            st.markdown(
-                f"- <a href='{u}'>{t}</a> ({when})  "
-                f"<span style='color:gray'>LLM: {meta.get('confidence',0):.2f}"
-                + (f" · {_m}" if _m else "")
-                + "</span>",
-                unsafe_allow_html=True
-            )
+        # 모니터링 가시성: bypass/parse_fail 라벨 표시
+        if it.get("_llm_bypass"):
+            tag = f"<span style='color:gray'>LLM:bypass({it.get('_llm_bypass')})</span>"
+        elif meta is None:
+            tag = "<span style='color:gray'>LLM:parse_fail</span>"
         else:
-            st.markdown(f"- <a href='{u}'>{t}</a> ({when})", unsafe_allow_html=True)
+            _m = ", ".join([str(x) for x in (meta.get("matched") or [])][:6])
+            tag = f"<span style='color:gray'>LLM: {meta.get('confidence',0):.2f}" + (f" · {_m}" if _m else "") + "</span>"
+
+        st.markdown(
+            f"- <a href='{u}'>{t}</a> ({when})  {tag}",
+            unsafe_allow_html=True
+        )
