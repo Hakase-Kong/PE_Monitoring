@@ -973,7 +973,6 @@ chat_id = st.sidebar.text_input("Telegram Chat ID (채널/그룹)", value=os.get
 st.sidebar.divider()
 st.sidebar.subheader("전송/수집 파라미터")
 cfg["PAGE_SIZE"] = int(st.sidebar.number_input("페이지당 수집 수", min_value=10, max_value=100, step=1, value=int(cfg.get("PAGE_SIZE", 30))))
-cfg["INTERVAL_MIN"] = int(st.sidebar.number_input("전송 주기(분)", min_value=5, max_value=10080, step=5, value=int(cfg.get("INTERVAL_MIN", cfg.get("TRANSMIT_INTERVAL_MIN", 1440)))))
 cfg["RECENCY_HOURS"] = int(st.sidebar.number_input("신선도(최근 N시간)", min_value=6, max_value=168, step=6, value=int(cfg.get("RECENCY_HOURS", 72))))
 
 # ✅ 시간 정책 토글
