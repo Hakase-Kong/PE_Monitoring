@@ -80,6 +80,57 @@ def is_holiday(kst: dt.datetime, holidays: List[str]) -> bool:
 def between_working_hours(kst: dt.datetime, start=8, end=20) -> bool:
     return start <= kst.hour < end
 
+# ===== [Scheduler Helpers] =====
+def _map_days_for_cron(days_ui: list[str]) -> str:
+    """
+    UI에서 받은 ["매일"] 또는 ["월","수","금"] 을 APScheduler 'cron' day_of_week 포맷으로 변환
+    """
+    if not days_ui or "매일" in days_ui:
+        return "*"  # 매일
+    m = {"월":"mon", "화":"tue", "수":"wed", "목":"thu", "금":"fri", "토":"sat", "일":"sun"}
+    mapped = [m[d] for d in days_ui if d in m]
+    return ",".join(mapped) if mapped else "*"
+
+def ensure_cron_job(sched: BackgroundScheduler, cfg: dict):
+    job_id = "pe_news_job"
+    try:
+        sched.remove_job(job_id)
+    except Exception:
+        pass
+    day_of_week = _map_days_for_cron(cfg.get("CRON_DAYS_UI", ["매일"]))
+    hour = int(cfg.get("CRON_HOUR", 9))
+    minute = int(cfg.get("CRON_MINUTE", 0))
+    sched.add_job(
+        scheduled_job, "cron",
+        id=job_id, replace_existing=True,
+        day_of_week=day_of_week, hour=hour, minute=minute
+    )
+
+def ensure_interval_job(sched: BackgroundScheduler, minutes: int):
+    job_id = "pe_news_job"
+    try:
+        sched.remove_job(job_id)
+    except Exception:
+        pass
+    sched.add_job(
+        scheduled_job, "interval",
+        id=job_id, replace_existing=True,
+        minutes=int(minutes),
+        next_run_time=now_kst()    # 시작 즉시 1회 실행
+    )
+
+def ensure_scheduled_job(sched: BackgroundScheduler, cfg: dict):
+    """
+    cfg["SCHEDULE_MODE"]:
+      - '주기(분)': interval 스케줄, 시작 즉시 1회 전송
+      - '요일/시각(주간/매일)': cron 스케줄, 시작 즉시 전송하지 않음
+    """
+    mode = cfg.get("SCHEDULE_MODE", "주기(분)")
+    if mode == "주기(분)":
+        ensure_interval_job(sched, int(cfg.get("INTERVAL_MIN", 60)))
+    else:
+        ensure_cron_job(sched, cfg)
+
 # -------------------------
 # 전송 캐시 (중복 방지)
 # -------------------------
@@ -172,11 +223,11 @@ def save_sent_cache_v2(url_map: dict, story_map: dict) -> None:
     except Exception as e:
         log.warning("전송 캐시 저장 실패(v2): %s", e)
 
-def search_naver_news(keyword: str, client_id: str, client_secret: str, recency_hours=72) -> List[dict]:
+def search_naver_news(keyword: str, client_id: str, client_secret: str, recency_hours=72, page_size: int = 30) -> List[dict]:
     if not client_id or not client_secret or not keyword:
         return []
     base = "https://openapi.naver.com/v1/search/news.json"
-    params = {"query": keyword, "display": clamp(int(cfg.get("PAGE_SIZE", 30)), 10, 100), "sort": "date"}
+    params = {"query": keyword, "display": clamp(int(page_size), 10, 100), "sort": "date"}
     headers = {
         "X-Naver-Client-Id": client_id,
         "X-Naver-Client-Secret": client_secret,
@@ -702,10 +753,12 @@ def collect_all(cfg: dict, env: dict) -> List[dict]:
 
     # Naver
     for kw in keywords:
-        batch = search_naver_news(kw, env.get("NAVER_CLIENT_ID", ""), env.get("NAVER_CLIENT_SECRET", ""), recency_hours=recency_hours)
+        batch = search_naver_news(
+            kw, env.get("NAVER_CLIENT_ID",""), env.get("NAVER_CLIENT_SECRET",""),
+            recency_hours=recency_hours, page_size=int(cfg.get("PAGE_SIZE", 30))
+        )
         all_items += batch
-        time.sleep(0.2)
-
+    
     # NewsAPI (선택)
     if env.get("NEWSAPI_KEY") and keywords:
         query = " OR ".join(keywords)
@@ -733,16 +786,12 @@ def format_telegram_text(items: List[dict], cfg: dict = {} ) -> str:
             lines.append(f"• <a href=\"{u}\">{t}</a> ({when})")
     return "\n".join(lines)
 
-def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
+def send_telegram(bot_token: str, chat_id: str, text: str, disable_preview: bool = True) -> bool:
     if not bot_token or not chat_id:
         return False
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+               "disable_web_page_preview": disable_preview}
     try:
         r = requests.post(url, json=payload, timeout=12)
         r.raise_for_status()
@@ -752,9 +801,8 @@ def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
         return False
 
 def _should_skip_by_time(cfg: dict) -> bool:
-    """업무시간/주말/공휴일 옵션에 따라 전송을 건너뛸지 판단"""
     kst_now = now_kst()
-    if cfg.get("ONLY_WORKING_HOURS") and not between_working_hours(kst_now, 8, 20):
+    if cfg.get("ONLY_WORKING_HOURS") and not between_working_hours(kst_now, 6, 20):  # 08→06
         return True
     if cfg.get("BLOCK_WEEKEND") and is_weekend(kst_now):
         return True
@@ -777,6 +825,7 @@ def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
     try:
         all_items = collect_all(cfg, env)
         ranked = rank_filtered(all_items, cfg)  # 1차: 규칙 기반 필터
+        ranked = pe_focus_filter(ranked, cfg) # PE 선택 필터
         ranked = llm_filter_items(ranked, cfg, env)  # 2차: LLM 필터 (옵션)
         ranked = llm_dedup_items(ranked, cfg, env)   # 3차: LLM 중복판정 (옵션) ← ✅ 여기 추가
 
@@ -812,7 +861,7 @@ def transmit_once(cfg: dict, env: dict, preview=False) -> dict:
         for i in range(0, len(new_items), BATCH):
             chunk = new_items[i:i+BATCH]
             text = format_telegram_text(chunk, cfg)
-            ok = send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), text)
+            ok = send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), text, disable_preview=bool(cfg.get("TELEGRAM_DISABLE_PREVIEW", True)))
             sent_any = sent_any or ok
             time.sleep(0.6)
 
@@ -843,16 +892,6 @@ def scheduled_job():
     except Exception as e:
         log.exception("스케줄 작업 실패: %s", e)
 
-def ensure_interval_job(sched: BackgroundScheduler, minutes: int):
-    job_id = "pe_news_job"
-    try:
-        sched.remove_job(job_id)
-    except Exception:
-        pass
-    # next_run_time=now → 스케줄러가 즉시 1회 실행을 트리거 (수동 호출 금지)
-    sched.add_job(scheduled_job, "interval", minutes=minutes, id=job_id,
-                  replace_existing=True, next_run_time=now_kst())
-
 def is_running(_: BackgroundScheduler = None) -> bool:
     try:
         sched = get_scheduler()
@@ -862,13 +901,18 @@ def is_running(_: BackgroundScheduler = None) -> bool:
 
 # 스케줄 시작/중지(버튼 핸들러용) — 여기서만 global 사용
 def start_schedule(cfg_path: str, cfg_dict: dict, env: dict, minutes: int):
+    """
+    버튼 클릭 시 스케줄 시작.
+    - 주기(분) 모드: 스케줄 등록 + 즉시 1회 전송
+    - 요일/시각 모드: 스케줄 등록만 (즉시 전송하지 않음)
+    """
     global CURRENT_CFG_PATH, CURRENT_CFG_DICT, CURRENT_ENV
     CURRENT_CFG_PATH = cfg_path
-    CURRENT_CFG_DICT = dict(cfg_dict)  # UI 조정 옵션까지 스냅샷 저장
+    CURRENT_CFG_DICT = dict(cfg_dict)
     CURRENT_ENV = env
+
     sched = get_scheduler()
-    ensure_interval_job(sched, minutes)
-    # 주의: 즉시 실행은 스케줄러 next_run_time으로만 유도(수동 scheduled_job() 호출 금지)
+    ensure_scheduled_job(sched, CURRENT_CFG_DICT)
 
 def stop_schedule():
     sched = get_scheduler()
@@ -876,6 +920,33 @@ def stop_schedule():
         sched.remove_job("pe_news_job")
     except Exception:
         pass
+
+# ===== [Filter] 특정 PE 포커스 =====
+def pe_focus_filter(items: list[dict], cfg: dict) -> list[dict]:
+    """
+    cfg['PE_FOCUS']가 비어 있지 않으면, 제목/요약/본문에
+    해당 키워드(PE명)가 하나라도 포함된 기사만 통과시킵니다.
+    items: 각 원소는 {"title","summary","content","url",...}
+    """
+    focus = [s.strip() for s in cfg.get("PE_FOCUS", []) if isinstance(s, str) and s.strip()]
+    if not focus:
+        return items
+
+    def _hit(text: str) -> bool:
+        if not text:
+            return False
+        low = text.lower()
+        for kw in focus:
+            if kw.lower() in low:
+                return True
+        return False
+
+    out = []
+    for it in items:
+        text = f"{it.get('title','')} {it.get('summary','')} {it.get('content','')}"
+        if _hit(text):
+            out.append(it)
+    return out
 
 # -------------------------
 # Streamlit UI
@@ -902,20 +973,56 @@ chat_id = st.sidebar.text_input("Telegram Chat ID (채널/그룹)", value=os.get
 st.sidebar.divider()
 st.sidebar.subheader("전송/수집 파라미터")
 cfg["PAGE_SIZE"] = int(st.sidebar.number_input("페이지당 수집 수", min_value=10, max_value=100, step=1, value=int(cfg.get("PAGE_SIZE", 30))))
-cfg["INTERVAL_MIN"] = int(st.sidebar.number_input("전송 주기(분)", min_value=5, max_value=360, step=5, value=int(cfg.get("INTERVAL_MIN", cfg.get("TRANSMIT_INTERVAL_MIN", 60)))))
+cfg["INTERVAL_MIN"] = int(st.sidebar.number_input("전송 주기(분)", min_value=5, max_value=10080, step=5, value=int(cfg.get("INTERVAL_MIN", cfg.get("TRANSMIT_INTERVAL_MIN", 1440)))))
 cfg["RECENCY_HOURS"] = int(st.sidebar.number_input("신선도(최근 N시간)", min_value=6, max_value=168, step=6, value=int(cfg.get("RECENCY_HOURS", 72))))
 
 # ✅ 시간 정책 토글
 st.sidebar.subheader("시간 정책")
-cfg["ONLY_WORKING_HOURS"] = bool(st.sidebar.checkbox("✅ 업무시간(08~20 KST) 내 전송", value=bool(cfg.get("ONLY_WORKING_HOURS", True))))
-cfg["BLOCK_WEEKEND"]     = bool(st.sidebar.checkbox("🚫 주말 미전송", value=bool(cfg.get("BLOCK_WEEKEND", True))))
+cfg["ONLY_WORKING_HOURS"] = bool(st.sidebar.checkbox("✅ 업무시간(06~20 KST) 내 전송", value=bool(cfg.get("ONLY_WORKING_HOURS", True))))
+cfg["BLOCK_WEEKEND"]     = bool(st.sidebar.checkbox("🚫 주말 미전송", value=bool(cfg.get("BLOCK_WEEKEND", False))))
 cfg["BLOCK_HOLIDAY"]     = bool(st.sidebar.checkbox("🚫 공휴일 미전송", value=bool(cfg.get("BLOCK_HOLIDAY", False))))
 holidays_text = st.sidebar.text_area("공휴일(YYYY-MM-DD, 쉼표 또는 줄바꿈 구분)", value=", ".join(cfg.get("HOLIDAYS", [])))
 cfg["HOLIDAYS"] = [s.strip() for s in re.split(r"[,\n]", holidays_text) if s.strip()]
 
+st.sidebar.subheader("전송 스케줄")
+
+cfg["SCHEDULE_MODE"] = st.sidebar.radio("스케줄 방식", options=["주기(분)", "요일/시각(주간/매일)"], index=0 if cfg.get("SCHEDULE_MODE", "주기(분)") == "주기(분)" else 1, horizontal=False)
+if cfg["SCHEDULE_MODE"] == "주기(분)":
+    cfg["INTERVAL_MIN"] = int(st.sidebar.number_input(
+        "전송 주기(분)",
+        min_value=5, max_value=10080, step=5,
+        value=int(cfg.get("INTERVAL_MIN", 60))
+    ))
+    st.sidebar.caption("최대 1주일(=10080분)까지 설정 가능. 스케줄 시작 시 즉시 1회 전송 후 주기적으로 전송합니다.")
+
+# (신규) 요일/시각 스케줄: 주 1회 또는 매일
+else:
+    # 선택 가능한 요일
+    WEEKDAY_LABELS = ["매일", "월", "화", "수", "목", "금", "토", "일"]
+    # 기본 선택값
+    default_days = cfg.get("CRON_DAYS_UI", ["매일"])
+    # UI: 다중 선택
+    selected_days = st.sidebar.multiselect(
+        "전송 요일 선택 (매일을 선택하면 다른 요일은 무시됩니다)",
+        options=WEEKDAY_LABELS,
+        default=default_days
+    )
+    # 결과 저장 (UI 표기 그대로도 보존)
+    cfg["CRON_DAYS_UI"] = selected_days[:] if selected_days else ["매일"]
+
+    # 시간 선택
+    t = st.sidebar.time_input(
+        "전송 시각 (KST)",
+        value=dt.time(hour=int(cfg.get("CRON_HOUR", 9)), minute=int(cfg.get("CRON_MINUTE", 0)))
+    )
+    cfg["CRON_HOUR"] = int(t.hour)
+    cfg["CRON_MINUTE"] = int(t.minute)
+
+    st.sidebar.caption("요일/시각 모드에서는 '스케줄 시작'을 눌러도 즉시 전송하지 않고 지정 시각에만 전송합니다.")
+
 # 기타 필터 토글
 st.sidebar.subheader("기타 필터")
-cfg["ALLOWLIST_STRICT"] = bool(st.sidebar.checkbox("🧱 ALLOWLIST_STRICT (허용 도메인 외 차단)", value=bool(cfg.get("ALLOWLIST_STRICT", True))))
+cfg["ALLOWLIST_STRICT"] = bool(st.sidebar.checkbox("🧱 ALLOWLIST_STRICT (허용 도메인 외 차단)", value=bool(cfg.get("ALLOWLIST_STRICT", False))))
 
 # NEW: LLM 필터 옵션
 st.sidebar.subheader("LLM 필터(선택)")
@@ -923,6 +1030,20 @@ cfg["USE_LLM_FILTER"] = bool(st.sidebar.checkbox("🤖 OpenAI로 2차 필터링"
 cfg["LLM_MODEL"] = st.sidebar.text_input("모델", value=cfg.get("LLM_MODEL", "gpt-4o-mini"))
 cfg["LLM_CONF_THRESHOLD"] = float(st.sidebar.slider("채택 임계치(신뢰도)", min_value=0.0, max_value=1.0, value=float(cfg.get("LLM_CONF_THRESHOLD", 0.7)), step=0.05))
 cfg["LLM_MAX_TOKENS"] = int(st.sidebar.number_input("max_tokens", min_value=64, max_value=1000, step=10, value=int(cfg.get("LLM_MAX_TOKENS", 300))))
+
+# ===== [UI] 특정 PE 선택 =====
+st.sidebar.subheader("🎯 특정 PE 선택(선택)")
+# 후보 목록은 config.json의 "PE_CANDIDATES"를 우선 사용, 없으면 아래 기본
+pe_candidates_default = [
+    "MBK", "IMM", "Hahn&Co", "VIG", "글랜우드", "베인", "KKR", "Carlyle", "한앤코",
+    "스틱", "H&Q", "브릿지", "JIP", "Affinity", "TPG", "KCGI", "한화", "맥쿼리"
+]
+pe_candidates = cfg.get("PE_CANDIDATES", pe_candidates_default)
+cfg["PE_FOCUS"] = st.sidebar.multiselect(
+    "특정 PE만 선별(비워두면 전체)",
+    options=pe_candidates,
+    default=cfg.get("PE_FOCUS", [])
+)
 
 st.sidebar.divider()
 if st.sidebar.button("구성 리로드", use_container_width=True):
@@ -957,7 +1078,10 @@ with col2:
 with col3:
     if st.button("스케줄 시작"):
         start_schedule(cfg_path=cfg_path, cfg_dict=cfg, env=make_env(), minutes=int(cfg["INTERVAL_MIN"]))
-        st.success("스케줄 시작됨 (즉시 1회 전송 후 주기 실행)")
+        if cfg.get("SCHEDULE_MODE","주기(분)") == "주기(분)":
+            st.success("스케줄 시작됨: 즉시 1회 전송 후 주기적으로 실행")
+        else:
+            st.success("스케줄 시작됨: 지정된 요일/시각에만 전송(시작 즉시 전송 없음)")
         st.rerun()
 
 with col4:
