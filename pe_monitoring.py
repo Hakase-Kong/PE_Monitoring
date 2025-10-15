@@ -470,38 +470,31 @@ def should_drop(item: dict, cfg: dict) -> bool:
             if sid not in sids:
                 return True
 
-    # 제목 포함/제외 키워드
+    # ===== 공통 플래그 계산(먼저) =====
     include = (cfg.get("INCLUDE_TITLE_KEYWORDS", []) or [])
     has_include_kw = any(w.lower() in title.lower() for w in include)
 
-    # 운용사/워치리스트, 키워드 매칭
     firms = set([s.lower() for s in (cfg.get("FIRM_WATCHLIST", []) or [])])
     has_firm = any(f in title.lower() for f in firms)
 
-    # (완화) 맥락 단어가 없어도, 신뢰도메인 + (운용사명 or 포함키워드)이면 통과시켜 LLM에서 재판단
-    if not has_context:
-        if (src in trusted) and (has_firm or has_include_kw):
-            return False  # 드롭하지 않음(보류)
-        # 기존 로직 유지: 신뢰도메인 ∧ 모호토큰만 통과
-        if not (src in trusted and has_ambiguous):
-            return True
-
-    # PEF 맥락 필수 조건을 기본 적용하되,
-    # '신뢰 도메인 + 모호하지만 중요한 토큰(매각/공개매각/인수 등)'이면 LLM으로 넘기도록 우회 허용
     context_any = cfg.get("CONTEXT_REQUIRE_ANY", []) or []
     context = (title + " " + item.get("description", "")).lower()
-
     has_context = any(k.lower() in context for k in context_any)
 
     trusted = set(cfg.get("TRUSTED_SOURCES_FOR_FI", cfg.get("ALLOW_DOMAINS", [])) or [])
     amb_tokens = set(t.lower() for t in (cfg.get("STRICT_AMBIGUOUS_TOKENS", []) or []))
     has_ambiguous = any(tok in title.lower() for tok in amb_tokens)
 
-    # 맥락 단어가 없다면 → (신뢰 도메인 AND 모호토큰)일 때만 통과시켜 LLM에서 판단
+    # ===== 완화 로직 =====
+    # 맥락 단어가 없어도, (신뢰도메인 ∧ (운용사명 ∨ 포함키워드))이면 드롭하지 않고 LLM에 넘겨 판단
     if not has_context:
+        if (src in trusted) and (has_firm or has_include_kw):
+            return False
+        # 그 외에는 기존 보수 규칙 유지: 신뢰도메인 ∧ 모호토큰일 때만 통과
         if not (src in trusted and has_ambiguous):
             return True
 
+    # (기본) 맥락 단어가 있으면 통과
     return False
 
 def score_item(item: dict, cfg: dict) -> float:
