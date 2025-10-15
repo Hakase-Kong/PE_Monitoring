@@ -472,15 +472,20 @@ def should_drop(item: dict, cfg: dict) -> bool:
 
     # 제목 포함/제외 키워드
     include = (cfg.get("INCLUDE_TITLE_KEYWORDS", []) or [])
-    if include and not any(w.lower() in title.lower() for w in include):
-        return True
-    for w in (cfg.get("EXCLUDE_TITLE_KEYWORDS", []) or []):
-        if w and w.lower() in title.lower():
+    has_include_kw = any(w.lower() in title.lower() for w in include)
+
+    # 운용사/워치리스트, 키워드 매칭
+    firms = set([s.lower() for s in (cfg.get("FIRM_WATCHLIST", []) or [])])
+    has_firm = any(f in title.lower() for f in firms)
+
+    # (완화) 맥락 단어가 없어도, 신뢰도메인 + (운용사명 or 포함키워드)이면 통과시켜 LLM에서 재판단
+    if not has_context:
+        if (src in trusted) and (has_firm or has_include_kw):
+            return False  # 드롭하지 않음(보류)
+        # 기존 로직 유지: 신뢰도메인 ∧ 모호토큰만 통과
+        if not (src in trusted and has_ambiguous):
             return True
 
-    # -------------------------------
-    # 🔽 여기부터 수정/추가 부분
-    # -------------------------------
     # PEF 맥락 필수 조건을 기본 적용하되,
     # '신뢰 도메인 + 모호하지만 중요한 토큰(매각/공개매각/인수 등)'이면 LLM으로 넘기도록 우회 허용
     context_any = cfg.get("CONTEXT_REQUIRE_ANY", []) or []
@@ -571,9 +576,7 @@ def _openai_chat(messages: List[Dict], api_key: str, model: str, max_tokens: int
     return data["choices"][0]["message"]["content"]
 
 def llm_filter_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
-    if not items:
-        return items
-    if not bool(cfg.get("USE_LLM_FILTER", False)):
+    if not items or not bool(cfg.get("USE_LLM_FILTER", False)):
         return items
 
     api_key = env.get("OPENAI_API_KEY", "")
@@ -582,46 +585,71 @@ def llm_filter_items(items: List[dict], cfg: dict, env: dict) -> List[dict]:
         return items
 
     model = cfg.get("LLM_MODEL", "gpt-4o-mini")
-    conf_th = float(cfg.get("LLM_CONF_THRESHOLD", 0.7))  # ✅ 완화
-    out = []
+    base_th = float(cfg.get("LLM_CONF_THRESHOLD", 0.7))
+    # 부정-선택형: irrelevant 확신이 매우 높을 때만 제외
+    drop_th = min(1.0, base_th + 0.10)
 
+    trusted = set(cfg.get("TRUSTED_SOURCES_FOR_FI", []))
+    include = [w.lower() for w in (cfg.get("INCLUDE_TITLE_KEYWORDS", []) or [])]
+    firms   = [w.lower() for w in (cfg.get("FIRM_WATCHLIST", []) or [])]
+
+    def _has_kw_or_firm(t: str) -> bool:
+        t = (t or "").lower()
+        return any(k in t for k in include) or any(f in t for f in firms)
+
+    out = []
     for it in items:
+        src = domain_of(it.get("url",""))
+        title = it.get("title","")
+
+        # (바이패스1) 신뢰도메인 + (운용사/핵심키워드)면 LLM 생략하고 통과
+        if (src in trusted) and _has_kw_or_firm(title):
+            it["_llm_bypass"] = "trusted+kw"
+            out.append(it)
+            continue
+
         try:
             user_prompt = _llm_prompt_for_item(it, cfg)
             messages = [
                 {"role": "system", "content":
                     "You are a professional news classifier for Private Equity (KR). "
-                    "Classify only deals/events where a financial investor (PEF/GP/LP, co-invest, secondary, structured/NAV/pref-equity, PIPE, mezzanine, recap/refi) "
-                    "is involved or is plausibly involved. "
-                    "If a strategic investor (SI) conducts a pure industry M&A without FI involvement, mark relevant=false (category='industry M&A'). "
-                    "Return JSON only."
+                    "If unsure, prefer KEEP (relevant) to avoid false negatives. Return JSON only."
                 },
                 {"role": "user", "content": user_prompt},
             ]
             resp = _openai_chat(messages, api_key, model, max_tokens=int(cfg.get("LLM_MAX_TOKENS", 400)))
-            j = None
+            meta = None
             try:
-                j = json.loads(resp.strip())
+                meta = json.loads(resp.strip())
             except Exception:
-                import re as _re
-                m = _re.search(r"\{[\s\S]*\}$", resp.strip())
-                if m:
-                    j = json.loads(m.group(0))
+                m = re.search(r"\{[\s\S]*\}$", resp.strip()); meta = json.loads(m.group(0)) if m else None
 
-            # ✅ 완화된 조건: PE deal or finance general 둘 다 허용
-            cat = (j or {}).get("category", "").lower()
-            if (
-                isinstance(j, dict)
-                and j.get("relevant") is True
-                and float(j.get("confidence", 0.0)) >= conf_th
-                and cat in {"pe deal", "finance general"}
-            ):
-                it["_llm"] = j
+            # 기본은 통과(KEEP). 아래 조건에서만 DROP.
+            drop = False
+            if isinstance(meta, dict):
+                cat = (meta.get("category","") or "").lower()
+                conf = float(meta.get("confidence", 0.0))
+                rel  = bool(meta.get("relevant", False))
+
+                # (완화수용) 금융/산업 M&A라도 운용사/핵심키워드가 있으면 KEEP
+                if _has_kw_or_firm(title):
+                    rel = True
+
+                # 부정-선택형: irrelevant 이면서 확신이 높을 때만 드롭
+                if (rel is False) and (conf >= drop_th):
+                    drop = True
+
+                it["_llm"] = meta
+
+            if not drop:
                 out.append(it)
+            else:
+                it["_drop_reason"] = f"LLM irrelevant@{conf:.2f}"
+                log.info("LLM drop: %s | %s", it.get("title",""), it.get('url',""))
 
         except Exception as e:
-            log.warning("LLM 필터 처리 실패: %s", e)
-            out.append(it)
+            log.warning("LLM 필터 실패(보류): %s", e)
+            out.append(it)  # 실패 시 보수적으로 KEEP
 
     return out
 
