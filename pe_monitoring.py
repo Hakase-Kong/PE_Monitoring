@@ -432,8 +432,8 @@ def dedup(items: List[dict]) -> List[dict]:
                 if _sim_norm_title(t_norm, s["t_norm"]) >= 0.58:
                     is_dup = True
                     break
-            # 출처 달라도 제목이 거의 동일(0.72↑)이면 중복
-            if _sim_norm_title(t_norm, s["t_norm"]) >= 0.72:
+            # 출처 달라도 제목이 거의 동일(0.68↑)이면 중복
+            if _sim_norm_title(t_norm, s["t_norm"]) >= 0.68:
                 is_dup = True
                 break
 
