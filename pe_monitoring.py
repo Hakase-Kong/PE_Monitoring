@@ -408,7 +408,7 @@ def _sim_norm_title(a: str, b: str) -> float:
 
 def dedup(items: List[dict], cfg: dict | None = None) -> List[dict]:
     cfg = cfg or {}
-    xs_th = float(cfg.get("TITLE_SIM_XSRC", 0.62))       # 교차 출처 임계치
+    xs_th = float(cfg.get("TITLE_SIM_XSRC", 0.60))       # 교차 출처 임계치
     ss_th = float(cfg.get("TITLE_SIM_SAMESRC", 0.58))    # 동일 출처 임계치
     same_src_hours = int(cfg.get("SAME_SOURCE_WINDOW_HOURS", 24))  # 12→24h 권장
 
