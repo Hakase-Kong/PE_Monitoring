@@ -406,10 +406,12 @@ def _sim_norm_title(a: str, b: str) -> float:
     # 토큰 0.6, 바이그램 0.4 가중
     return 0.6 * ja + 0.4 * jb
 
-def dedup(items: List[dict]) -> List[dict]:
-    """
-    점수 높은 순으로 정렬 후, 동일 이슈(제목 유사 + 동일 출처 + 12h)에 속하면 제거.
-    """
+def dedup(items: List[dict], cfg: dict | None = None) -> List[dict]:
+    cfg = cfg or {}
+    xs_th = float(cfg.get("TITLE_SIM_XSRC", 0.62))       # 교차 출처 임계치
+    ss_th = float(cfg.get("TITLE_SIM_SAMESRC", 0.58))    # 동일 출처 임계치
+    same_src_hours = int(cfg.get("SAME_SOURCE_WINDOW_HOURS", 24))  # 12→24h 권장
+
     def _ts_kst(it):
         try:
             return dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ")\
@@ -417,8 +419,11 @@ def dedup(items: List[dict]) -> List[dict]:
         except Exception:
             return now_kst()
 
+    # “동일 딜 힌트” 사전 (FIRM_WATCHLIST + 핵심키워드)
+    hint_tokens = set([s.lower() for s in (cfg.get("FIRM_WATCHLIST", []) + cfg.get("KEYWORDS", []))])
+
     work = sorted(items, key=lambda x: x.get("_score", 0.0), reverse=True)
-    out, seen = [], []  # seen: dict(t_norm, src, ts)
+    out, seen = [], []
 
     for it in work:
         t_norm = normalize_title(it.get("title", ""))
@@ -426,14 +431,21 @@ def dedup(items: List[dict]) -> List[dict]:
         ts = _ts_kst(it)
         is_dup = False
 
+        t_tokens = _tokens(t_norm)
+
         for s in seen:
-            # 동일 출처 & 12시간 이내 & 제목유사도 0.58↑ → 동일 이슈 간주
-            if s["src"] == src and abs((ts - s["ts"]).total_seconds()) <= 12*3600:
-                if _sim_norm_title(t_norm, s["t_norm"]) >= 0.58:
+            # 동일 출처 & 시간창 내: 임계치 유지(또는 ss_th 미세조정)
+            if s["src"] == src and abs((ts - s["ts"]).total_seconds()) <= same_src_hours*3600:
+                if _sim_norm_title(t_norm, s["t_norm"]) >= ss_th:
                     is_dup = True
                     break
-            # 출처 달라도 제목이 거의 동일(0.68↑)이면 중복
-            if _sim_norm_title(t_norm, s["t_norm"]) >= 0.62:
+
+            # 교차 출처: 기본 xs_th, 단 동일 딜 힌트가 겹치면 0.02 완화
+            dyn_xs = xs_th
+            if hint_tokens & t_tokens & _tokens(s["t_norm"]):
+                dyn_xs = max(0.55, xs_th - 0.02)  # 과도 하향 방지 하한선 0.55
+
+            if _sim_norm_title(t_norm, s["t_norm"]) >= dyn_xs:
                 is_dup = True
                 break
 
@@ -517,7 +529,7 @@ def rank_filtered(items: List[dict], cfg: dict) -> List[dict]:
     for it in arr:
         it["_score"] = score_item(it, cfg)
     arr.sort(key=lambda x: x["_score"], reverse=True)
-    return dedup(arr)
+    return dedup(arr, cfg)   # ← cfg 전달
 
 # -------------------------
 # LLM 기반 2차 필터
