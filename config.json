@@ -22,20 +22,27 @@
     "Growth Capital",
     "PIPE",
     "메자닌",
-    "카브아웃", "carve-out", "스핀오프", "spin-off",
-    "컨티뉴에이션 펀드", "continuation fund", "세컨더리", "secondary",
-    "NAV 파이낸싱", "preferred equity", "structured equity",
-    "브릿지론", "RCF", "DIP", "PIK",
-    "유동화", "ABL", "셀사이드", "바이사이드"
+    "카브아웃",
+    "carve-out",
+    "스핀오프",
+    "spin-off",
+    "컨티뉴에이션 펀드",
+    "continuation fund",
+    "세컨더리",
+    "secondary",
+    "NAV 파이낸싱",
+    "preferred equity",
+    "structured equity",
+    "브릿지론",
+    "RCF",
+    "DIP",
+    "PIK",
+    "유동화",
+    "ABL",
+    "셀사이드",
+    "바이사이드"
   ],
   "KEYWORD_ALIASES": {
-    "바이아웃": [
-      "바이아웃",
-      "buyout",
-      "경영권 인수",
-      "takeover",
-      "control premium"
-    ],
     "M&A": [
       "인수합병",
       "merger",
@@ -91,20 +98,69 @@
       "CB",
       "EB"
     ],
-    "카브아웃": ["carve-out", "분할매각", "사업부 매각"],
-    "스핀오프": ["spin-off", "분할 신설", "물적분할", "인적분할"],
-    "컨티뉴에이션 펀드": ["continuation fund", "컨티뉴에이션", "연속 펀드"],
-    "세컨더리": ["secondary", "GP主導 세컨더리", "LP 지분매각", "지분세컨더리"],
-    "NAV 파이낸싱": ["NAV financing", "NAV 파이낸스"],
-    "preferred equity": ["pref equity", "우선주 투자", "프리퍼드 에쿼티"],
-    "structured equity": ["구조화 에쿼티", "구조화 투자"],
-    "브릿지론": ["bridge loan", "브릿지 파이낸싱"],
-    "RCF": ["revolving credit facility", "한도대출"],
-    "DIP": ["DIP financing", "법정관리 인수금융"],
-    "PIK": ["PIK toggle", "지급유예 이자"],
-    "ABL": ["자산유동화대출", "accounts receivable loan"],
-    "셀사이드": ["sell-side", "매각자 측"],
-    "바이사이드": ["buy-side", "인수자 측"]
+    "카브아웃": [
+      "carve-out",
+      "분할매각",
+      "사업부 매각"
+    ],
+    "스핀오프": [
+      "spin-off",
+      "분할 신설",
+      "물적분할",
+      "인적분할"
+    ],
+    "컨티뉴에이션 펀드": [
+      "continuation fund",
+      "컨티뉴에이션",
+      "연속 펀드"
+    ],
+    "세컨더리": [
+      "secondary",
+      "GP主導 세컨더리",
+      "LP 지분매각",
+      "지분세컨더리"
+    ],
+    "NAV 파이낸싱": [
+      "NAV financing",
+      "NAV 파이낸스"
+    ],
+    "preferred equity": [
+      "pref equity",
+      "우선주 투자",
+      "프리퍼드 에쿼티"
+    ],
+    "structured equity": [
+      "구조화 에쿼티",
+      "구조화 투자"
+    ],
+    "브릿지론": [
+      "bridge loan",
+      "브릿지 파이낸싱"
+    ],
+    "RCF": [
+      "revolving credit facility",
+      "한도대출"
+    ],
+    "DIP": [
+      "DIP financing",
+      "법정관리 인수금융"
+    ],
+    "PIK": [
+      "PIK toggle",
+      "지급유예 이자"
+    ],
+    "ABL": [
+      "자산유동화대출",
+      "accounts receivable loan"
+    ],
+    "셀사이드": [
+      "sell-side",
+      "매각자 측"
+    ],
+    "바이사이드": [
+      "buy-side",
+      "인수자 측"
+    ]
   },
   "FIRM_WATCHLIST": [
     "MBK",
@@ -199,8 +255,22 @@
     "news.naver.com": 1.0,
     "n.news.naver.com": 1.0
   },
-  "STRICT_AMBIGUOUS_TOKENS": ["매각", "공개매각", "인수", "M&A", "딜", "본입찰", "예비입찰"],
-  "TRUSTED_SOURCES_FOR_FI": ["www.thebell.co.kr", "www.investchosun.com", "dealsite.co.kr", "news.naver.com", "n.news.naver.com"],
+  "STRICT_AMBIGUOUS_TOKENS": [
+    "매각",
+    "공개매각",
+    "인수",
+    "M&A",
+    "딜",
+    "본입찰",
+    "예비입찰"
+  ],
+  "TRUSTED_SOURCES_FOR_FI": [
+    "www.thebell.co.kr",
+    "www.investchosun.com",
+    "dealsite.co.kr",
+    "news.naver.com",
+    "n.news.naver.com"
+  ],
   "CONTEXT_REQUIRE_ANY": [
     "사모펀드",
     "PE",
@@ -231,15 +301,23 @@
     "칼라일",
     "EQT",
     "블랙스톤",
-    "재무자문", "법률자문", "주관사",
-    "세일즈사이드", "바이사이드",
-    "베인", "피치북", "리피니티브", "리서치 보고서"
+    "재무자문",
+    "법률자문",
+    "주관사",
+    "세일즈사이드",
+    "바이사이드",
+    "베인",
+    "피치북",
+    "리피니티브",
+    "리서치 보고서"
   ],
   "EXCLUDE_TITLE_REGEX": [
     "(상속세|물납|종부세|국세청)"
   ],
   "SCHEDULE_MODE": "주기(분)",
-  "CRON_DAYS_UI": ["매일"],
+  "CRON_DAYS_UI": [
+    "매일"
+  ],
   "CRON_HOUR": 9,
   "CRON_MINUTE": 0,
   "RECENCY_HOURS": 24,
@@ -247,8 +325,26 @@
   "ONLY_WORKING_HOURS": true,
   "BLOCK_WEEKEND": false,
   "BLOCK_HOLIDAY": false,
-  "PE_CANDIDATES": ["MBK","IMM","Hahn&Co","VIG","글랜우드","베인","KKR","Carlyle","한앤코",
-    "스틱","H&Q","브릿지","JIP","Affinity","TPG","KCGI","한화","맥쿼리"],
+  "PE_CANDIDATES": [
+    "MBK",
+    "IMM",
+    "Hahn&Co",
+    "VIG",
+    "글랜우드",
+    "베인",
+    "KKR",
+    "Carlyle",
+    "한앤코",
+    "스틱",
+    "H&Q",
+    "브릿지",
+    "JIP",
+    "Affinity",
+    "TPG",
+    "KCGI",
+    "한화",
+    "맥쿼리"
+  ],
   "HOLIDAYS": [],
   "TELEGRAM_DISABLE_PREVIEW": true,
   "SHOW_SOURCE_DOMAIN": false,
@@ -276,5 +372,19 @@
   "LLM_DEDUP_WINDOW_HOURS": 48,
   "TITLE_SIM_XSRC": 0.58,
   "TITLE_SIM_SAMESRC": 0.58,
-  "SAME_SOURCE_WINDOW_HOURS": 24
+  "SAME_SOURCE_WINDOW_HOURS": 24,
+  "SYNONYM_MAP": {
+    "mergers & acquisitions": "m&a",
+    "merger": "m&a",
+    "acquisition": "인수",
+    "tender offer": "공개매수",
+    "takeover": "인수",
+    "sell-down": "지분매각",
+    "spin-off": "스핀오프",
+    "carve-out": "카브아웃",
+    "imm인베스트먼트": "imm인베",
+    "imm investment": "imm인베",
+    "private equity": "pe",
+    "사모펀드": "pe"
+  }
 }
