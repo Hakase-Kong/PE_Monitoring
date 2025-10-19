@@ -445,8 +445,8 @@ def dedup(items: List[dict], cfg: dict | None = None) -> List[dict]:
             return now_kst()
 
     cfg = cfg or {}
-    xs_th = float(cfg.get("TITLE_SIM_XSRC", 0.62))
-    ss_th = float(cfg.get("TITLE_SIM_SAMESRC", 0.58))
+    xs_th = float(cfg.get("TITLE_SIM_XSRC", 0.56))
+    ss_th = float(cfg.get("TITLE_SIM_SAMESRC", 0.52))
     same_src_hours = int(cfg.get("SAME_SOURCE_WINDOW_HOURS", 12))
 
     work = sorted(items, key=lambda x: x.get("_score", 0.0), reverse=True)
