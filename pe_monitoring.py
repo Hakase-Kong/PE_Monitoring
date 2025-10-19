@@ -312,50 +312,11 @@ NOISE_TAGS = {"단독","속보","시그널","fn마켓워치","투자360","영상
 BRACKET_RE   = re.compile(r"[\[\(（](.*?)[\]\)）]")
 MULTISPACE_RE = re.compile(r"\s+")
 SYNONYM_MAP = {
-    # 기존 키 유지 + 추가
     "imm인베스트먼트": "imm인베",
     "imm 인베스트먼트": "imm인베",
     "imm investment": "imm인베",
-
-    # 회사/브랜드 표기 통일
-    "hahn & company": "hahn&co",
-    "hahn and company": "hahn&co",
-    "keystone pe": "키스톤pe",
-    "korea investment partners": "키움pe",  # 필요 시 귀사 워치리스트 표기에 맞춰 조정
-
-    # 거래 용어(영/한) 통일
     "mergers & acquisitions": "m&a",
-    "merger": "m&a",
-    "acquisition": "인수",
-    "takeover": "인수",
-    "sell-down": "지분매각",
-    "sell down": "지분매각",
-    "tender offer": "공개매수",
-    "tob": "공개매수",
-
-    "refinancing": "리파이낸싱",
-    "recapitalization": "리캡",
-    "recap": "리캡",
-
-    "carve-out": "카브아웃",
-    "spin-off": "스핀오프",
-    "spin off": "스핀오프",
-
-    "continuation fund": "컨티뉴에이션 펀드",
-    "secondary": "세컨더리",
-
-    "preferred equity": "pref equity",
-    "pref. equity": "pref equity",
-    "structured equity": "구조화 에쿼티",
-
-    "bridge loan": "브릿지론",
-    "rcf": "rcf",
-    "dip financing": "dip",
-    "pik toggle": "pik",
-
-    # 기타 자주 나오는 형태
-    "private equity": "사모펀드",
-    "pe firm": "사모펀드",
+    "인베스트먼트": "인베",
 }
 
 def canonical_url_id(url: str) -> str:
@@ -482,7 +443,7 @@ def dedup(items: List[dict], cfg: dict | None = None) -> List[dict]:
             # 교차 출처: 기본 xs_th, 단 동일 딜 힌트가 겹치면 0.02 완화
             dyn_xs = xs_th
             if hint_tokens & t_tokens & _tokens(s["t_norm"]):
-                dyn_xs = max(0.55, xs_th - 0.03)  # 과도 하향 방지 하한선 0.55
+                dyn_xs = max(0.55, xs_th - 0.02)  # 과도 하향 방지 하한선 0.55
 
             if _sim_norm_title(t_norm, s["t_norm"]) >= dyn_xs:
                 is_dup = True
@@ -821,7 +782,6 @@ def collect_all(cfg: dict, env: dict) -> List[dict]:
 def format_telegram_text(items: List[dict], cfg: dict = {} ) -> str:
     if not items:
         return "📭 신규 뉴스 없음"
-    items = sorted(items, key=lambda it: it.get("publishedAt",""), reverse=True)
     lines = ["📌 <b>국내 PE 동향 관련 뉴스</b>"]
     for it in items:
         t = it.get("title", "").strip()
@@ -1158,16 +1118,6 @@ for j in jobs:
 st.subheader("📋 필터링된 전체 기사")
 res = st.session_state.get("preview", {"items": []})
 items = res.get("items", [])
-
-# 추가: 최신순(UTC publishedAt 기준) 정렬
-def _ts_utc(it):
-    try:
-        return dt.datetime.strptime(it["publishedAt"], "%Y-%m-%dT%H:%M:%SZ")
-    except Exception:
-        return dt.datetime.min.replace(tzinfo=None)
-
-items = sorted(items, key=_ts_utc, reverse=True)
-
 if not items:
     st.write("결과 없음")
 else:
